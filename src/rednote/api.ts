@@ -1,0 +1,511 @@
+// Side-effect module: embedded webview session + signed XHS API client.
+//
+// Data path (per ADR-007): the API requests are issued from INSIDE the
+// already-loaded Xiaohongshu webview page context, so cookies and the browser
+// signing are handled by XHS's own front-end JS. This avoids reimplementing the
+// signature algorithm and survives algorithm changes.
+//
+// Verified against (2026-09-14):
+//  - MediaCrawler (NanmiCoder/MediaCrawler) media_platform/xhs/{client,core,help,login}.py
+//  - ReaJason/xhs (the library MediaCrawler's xhs module builds on) xhs/core.py
+//    * favorites list : GET  /api/sns/web/v2/note/collect/page  {user_id,num,cursor}
+//    * note detail    : POST /api/sns/web/v1/feed               -> items[0].note_card
+//    * login check    : GET  /api/sns/web/v1/user/selfinfo      -> data.result.success
+//    * host           : edith.xiaohongshu.com
+//    * UA             : stable Chrome (MediaCrawler core.py user_agent)
+//
+// This file imports obsidian; keep it OUT of unit tests (tests only touch the
+// pure modules).
+
+import {
+	NotLoggedInError,
+	SignError,
+	type RedNoteRaw,
+	type RedNoteSign,
+} from "./types";
+import { parseListPage, shouldContinue, type RawListData } from "./pagination";
+import { mergeNoteCard } from "./extract";
+
+/** The partition isolates this session from Obsidian's default browser session. */
+const WEBVIEW_PARTITION = "persist:rednote-sync";
+/**
+ * Stable Chrome UA. The default Electron UA contains "Electron", which XHS is
+ * known to fingerprint and reject. Mirrors MediaCrawler core.py user_agent.
+ */
+const CHROME_UA =
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+	"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+const HOST = "https://edith.xiaohongshu.com";
+const INDEX_URL = "https://www.xiaohongshu.com";
+/** Allowed host suffixes for in-webview navigation (XHS domains only). */
+const ALLOWED_HOSTS = [
+	"www.xiaohongshu.com",
+	"edith.xiaohongshu.com",
+	"xiaohongshu.com",
+	"rednote.com",
+	"xhscdn.com",
+];
+
+/** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
+type WebviewEl = HTMLElement & {
+	partition?: string;
+	userAgent?: string;
+	allowpopups?: boolean;
+	src?: string;
+	/** Navigate the webview to a URL (the way to pull a hijacked frame back). */
+	loadURL?: (url: string) => void;
+	executeJavaScript?: (code: string) => Promise<unknown>;
+};
+
+export function isXhsHost(url: string): boolean {
+	try {
+		const host = new URL(url).hostname.toLowerCase();
+		return ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Extract the target URL from a webview navigation event's `detail`.
+ * Returns undefined when no URL is present (e.g. a bare Event), in which case
+ * the caller treats it as "not off-domain" and does nothing.
+ */
+function navEventUrl(e: Event): string | undefined {
+	const detail = (e as CustomEvent<unknown>).detail;
+	if (detail && typeof detail === "object") {
+		const url = (detail as { url?: unknown }).url;
+		if (typeof url === "string") {
+			return url;
+		}
+	}
+	return undefined;
+}
+
+
+/** Thrown when a page request fails after one retry (non-login error). */
+export class FetchError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "FetchError";
+	}
+}
+
+/**
+ * Owns the resident webview, login state, and the signed data pipeline.
+ *
+ * The webview is created on first use and is NEVER removed from the DOM
+ * (only hidden via display:none). Removing it would drop the session and
+ * require a re-login. `destroy()` removes it only on plugin unload.
+ */
+export class RedNoteSession {
+	private container: HTMLElement | null = null;
+	private webview: WebviewEl | null = null;
+	private readyPromise: Promise<void> | null = null;
+
+	/**
+	 * Ensure a resident webview exists and is loaded with the XHS homepage.
+	 * Idempotent: returns the existing (ready) webview if one is present.
+	 *
+	 * The webview is mounted in a container attached to `document` and kept
+	 * alive via display:none so the browser session (cookies + page JS)
+	 * persists across sync runs.
+	 */
+	ensureWebview(): Promise<WebviewEl> {
+		if (this.webview && this.readyPromise) {
+			return this.readyPromise.then(() => this.webview as WebviewEl);
+		}
+		const el = document.createElement("webview") as WebviewEl;
+		el.partition = WEBVIEW_PARTITION;
+		el.userAgent = CHROME_UA;
+		el.allowpopups = false;
+
+		const container = document.createElement("div");
+		container.style.display = "none";
+		container.style.position = "fixed";
+		container.style.left = "-99999px";
+		container.style.top = "0";
+		container.style.width = "1200px";
+		container.style.height = "800px";
+		container.appendChild(el);
+		document.body.appendChild(container);
+
+		this.container = container;
+		this.webview = el;
+
+		// Navigation sandbox (see note below): keep the webview confined to XHS
+		// domains. This is a best-effort hardening against open-redirect style
+		// exfiltration of the logged-in session; it is NOT a security boundary
+		// for the credentials themselves.
+
+		// (1) Popup path — valid: new-window fires BEFORE the popup is created
+		//     and CAN be cancelled with preventDefault. allowpopups=false adds a
+		//     second layer that blocks window.open popups entirely.
+		el.addEventListener("new-window", (e: Event) => {
+			const url = navEventUrl(e);
+			if (typeof url === "string" && !isXhsHost(url)) {
+				(e as CustomEvent<unknown>).preventDefault?.();
+			}
+		});
+
+		// (2) Main-frame same-window navigation. On Electron's <webview>,
+		//     `will-navigate` is NOT a cancellable element event (that is a CDP /
+		//     main-process callback) — the element fires `did-navigate` /
+		//     `did-navigate-in-page` AFTER the navigation has already happened,
+		//     and those cannot be cancelled. The practical mitigation is to
+		//     detect an off-domain current URL and immediately load the XHS home
+		//     page back, so any hijacked page is only briefly visible.
+		//     (If a build does emit a cancellable will-navigate we still listen
+		//     for it and preventDefault as a bonus — it never fires on the
+		//     standard element, so it is harmless.)
+		const forceBackHome = () => {
+			if (typeof el.loadURL === "function") {
+				el.loadURL(INDEX_URL);
+			} else {
+				el.src = INDEX_URL;
+			}
+		};
+		const watchNavigation = (name: string, cancellable: boolean) => {
+			el.addEventListener(name, (e: Event) => {
+				const url = navEventUrl(e);
+				if (typeof url === "string" && !isXhsHost(url)) {
+					if (cancellable) {
+						(e as CustomEvent<unknown>).preventDefault?.();
+						// Even if cancelled, re-assert home in case the nav
+						// partially went through.
+						forceBackHome();
+					} else {
+						forceBackHome();
+					}
+				}
+			});
+		};
+		watchNavigation("will-navigate", true);
+		watchNavigation("did-navigate", false);
+		watchNavigation("did-navigate-in-page", false);
+
+		this.readyPromise = new Promise<void>((resolve) => {
+			el.addEventListener("did-finish-load", () => resolve(), { once: true });
+			// Safety: resolve even if the event never fires (e.g. blocked nav),
+			// after a bounded wait, so callers don't hang forever.
+			window.setTimeout(() => resolve(), 30000);
+		});
+
+		el.src = INDEX_URL;
+		return this.readyPromise.then(() => el);
+	}
+
+	/** The resident webview element (or null if never created). */
+	getWebview(): WebviewEl | null {
+		return this.webview;
+	}
+
+	/** Whether a webview is currently mounted and ready. */
+	isAlive(): boolean {
+		return this.webview !== null;
+	}
+
+	/**
+	 * Remove the resident webview from the DOM. Called on plugin unload only.
+	 * This intentionally destroys the session (next use requires re-login).
+	 */
+	destroy(): void {
+		this.container?.remove();
+		this.container = null;
+		this.webview = null;
+		this.readyPromise = null;
+	}
+
+	/**
+	 * Execute JS inside the webview page context and return the resolved value.
+	 * Used to grab XHS's own signing output and to issue signed fetches.
+	 */
+	async eval<T = unknown>(code: string): Promise<T> {
+		const wv = await this.ensureWebview();
+		if (!wv.executeJavaScript) {
+			throw new SignError("webview.executeJavaScript 不可用，无法在页面上下文执行请求");
+		}
+		return (await wv.executeJavaScript(code)) as T;
+	}
+
+	/**
+	 * Generate signed request headers by invoking XHS's own page JS.
+	 *
+	 * Community-documented function is `window._webmsxyw`. We also try a small
+	 * set of known alternate signatures in case the symbol was renamed. If none
+	 * is present we throw SignError (caller shows a Notice, no silent failure).
+	 */
+	async getSign(
+		method: "GET" | "POST",
+		uri: string,
+		data: Record<string, unknown> | null,
+	): Promise<RedNoteSign> {
+		// Build a small, self-contained JS snippet that locates XHS's own
+		// signing function and produces the four signed headers.
+		//
+		// ASSUMPTION (NEEDS_VERIFICATION): the page exposes a signing function
+		// callable as fn(uri, data) returning { x-s, x-t, x-s-common,
+		// x-b3-traceid } — the community-documented symbol is window._webmsxyw
+		// (see MediaCrawler + community notes). We try a small set of likely
+		// symbol names; if none yields a valid signature we throw SignError
+		// (the caller shows a Notice — no silent failure), per the contract.
+		// The exact call signature (and whether GET/POST differ) is not
+		// confirmed without a logged-in XHS session and must be re-checked.
+		const payload = JSON.stringify(data ?? {});
+		const code = `
+			(() => {
+				function norm(r) {
+					if (!r || typeof r !== 'object') return null;
+					const gs = r['x-s'] ?? r['X-S'] ?? r.xs;
+					const gt = r['x-t'] ?? r['X-T'] ?? r.xt;
+					const gc = r['x-s-common'] ?? r['X-S-Common'];
+					const gb = r['x-b3-traceid'] ?? r['X-B3-Traceid'];
+					if (!gs || !gt) return null;
+					return { 'X-S': gs, 'X-T': gt, 'x-s-common': gc || '', 'X-B3-Traceid': gb || '' };
+				}
+				function tryCall(fn, uri, data, m) {
+					try {
+						let r = null;
+						if (m === 'POST') {
+							r = fn(uri, data);
+							if (!r) r = fn(uri, JSON.stringify(data));
+						} else {
+							r = fn(uri, data);
+							if (!r) r = fn(uri);
+						}
+						return norm(r);
+					} catch (e) { return null; }
+				}
+				const cands = ['_webmsxyw','_webmsk','_wxhshow','_sign','_webSign'];
+				for (const name of cands) {
+					const fn = window[name];
+					if (typeof fn === 'function') {
+						const out = tryCall(fn, ${JSON.stringify(uri)}, ${payload}, ${JSON.stringify(method)});
+						if (out) return JSON.stringify(out);
+					}
+				}
+				return JSON.stringify(null);
+			})()
+		`;
+		const result = await this.eval<string | null>(code);
+		const parsed = result ? JSON.parse(result) : null;
+		if (!parsed || !parsed["X-S"] || !parsed["X-T"]) {
+			throw new SignError(
+				"无法在页面中定位小红书签名函数（window._webmsxyw 等），签名不可用。请重新打开登录窗口并确认页面完全加载后再同步。",
+			);
+		}
+		return parsed;
+	}
+
+	/**
+	 * Issue a signed request from inside the webview page context.
+	 * Returns the parsed `data` field of the XHS response envelope.
+	 *
+	 * On an unauthenticated response it throws NotLoggedInError so the caller
+	 * can guide the user to re-login.
+	 */
+	async request(
+		method: "GET" | "POST",
+		uri: string,
+		data: Record<string, unknown> | null,
+	): Promise<Record<string, unknown>> {
+		const sign = await this.getSign(method, uri, data);
+		const headers = {
+			accept: "application/json, text/plain, */*",
+			"content-type": "application/json;charset=UTF-8",
+			"X-S": sign["X-S"],
+			"X-T": sign["X-T"],
+			"x-s-common": sign["x-s-common"],
+			"X-B3-Traceid": sign["X-B3-Traceid"],
+		};
+
+		// Build the full URL. For GET, the query string must be encoded the same
+		// way the sign was computed (browser behavior, commas not encoded) to
+		// match MediaCrawler's _build_query_string.
+		let fullUrl = HOST + uri;
+		const body: string | undefined =
+			method === "POST" && data ? JSON.stringify(data) : undefined;
+
+		const init: Record<string, unknown> = {
+			method,
+			headers,
+			credentials: "include",
+		};
+		if (method === "GET" && data) {
+			const qs = Object.entries(data)
+				.map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+				.join("&");
+			fullUrl = `${fullUrl}?${qs}`;
+		} else if (method === "POST" && body !== undefined) {
+			init.body = body;
+		}
+
+		const code = `
+			(() => {
+				return fetch(${JSON.stringify(fullUrl)}, ${JSON.stringify(init)}).then(async (resp) => {
+					let text = await resp.text();
+					let json = null;
+					try { json = JSON.parse(text); } catch (e) {}
+					return JSON.stringify({ status: resp.status, json: json, text: text.slice(0, 500) });
+				});
+			})()
+		`;
+		const raw = await this.eval<string>(code);
+		const parsed = raw ? JSON.parse(raw) : null;
+		if (!parsed) {
+			throw new FetchError(`请求 ${uri} 无返回`);
+		}
+
+		const status = parsed.status as number;
+		if (status === 401 || status === 403) {
+			throw new NotLoggedInError("登录已失效，请重新登录");
+		}
+
+		const json: Record<string, unknown> | null = parsed.json;
+		if (json && typeof json === "object") {
+			const codeStr = json.code != null ? String(json.code) : "";
+			// 300011 security limit / 300012 IP block (per MediaCrawler client)
+			if (codeStr === "300012" || codeStr === "300011") {
+				throw new FetchError(
+					`小红书返回限制码 ${codeStr}（IP 风控 / 账号安全限制），请稍后重试`,
+				);
+			}
+			if (json.success === true) {
+				return (json.data ?? json) as Record<string, unknown>;
+			}
+			// Not-logged-in style response (selfinfo / list with no result.success)
+			const isAuthy =
+				uri.includes("user/selfinfo") ||
+				uri.includes("collect/page") ||
+				uri.includes("/feed");
+			if (isAuthy && json.success === false) {
+				// Distinguish "not logged in" from other failures via msg heuristics.
+				const msg = String(json.msg ?? "");
+				if (/未登录|登录|auth|login|token/i.test(msg)) {
+					throw new NotLoggedInError(`登录已失效：${msg || "接口要求登录"}`);
+				}
+			}
+			throw new FetchError(
+				`接口 ${uri} 返回失败：${json.msg ?? JSON.stringify(json).slice(0, 200)}`,
+			);
+		}
+		throw new FetchError(
+			`接口 ${uri} 返回非 JSON（HTTP ${status}）：${String(parsed.text ?? "").slice(0, 120)}`,
+		);
+	}
+
+	/**
+	 * Check login state via the selfinfo endpoint (verified in MediaCrawler
+	 * client.pong / query_self: success when data.result.success is true).
+	 */
+	async checkLogin(): Promise<boolean> {
+		try {
+			const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
+			const result = (data?.result ?? data) as Record<string, unknown> | undefined;
+			return Boolean(result && result.success === true);
+		} catch (e) {
+			if (e instanceof NotLoggedInError) return false;
+			// A sign / network error means we can't confirm login; treat as
+			// "unknown" -> false but let the caller distinguish if needed.
+			return false;
+		}
+	}
+
+	/**
+	 * Fetch the current user id (needed as the `user_id` for the collect list).
+	 * Derived from selfinfo.
+	 */
+	async getSelfUserId(): Promise<string> {
+		const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
+		const result = (data?.result ?? data) as Record<string, unknown> | undefined;
+		const basic = (result?.basic_info ?? result) as Record<string, user_selfinfo> | undefined;
+		const uid = basic?.user_id ?? (result as Record<string, unknown> | undefined)?.user_id;
+		return typeof uid === "string" ? uid : "";
+	}
+
+	/**
+	 * Fetch one page of the favorites list.
+	 * Endpoint (verified): GET /api/sns/web/v2/note/collect/page
+	 */
+	async fetchFavoritesPage(
+		userId: string,
+		cursor: string,
+	): Promise<{ items: RedNoteRaw[]; has_more: boolean; next_cursor: string }> {
+		const data = (await this.request("GET", "/api/sns/web/v2/note/collect/page", {
+			user_id: userId,
+			num: 30,
+			cursor,
+		})) as unknown as RawListData;
+		const page = parseListPage(data);
+		return page;
+	}
+
+	/**
+	 * Fetch a single note's detail.
+	 * Endpoint (verified): POST /api/sns/web/v1/feed -> items[0].note_card
+	 */
+	async fetchNoteDetail(
+		noteId: string,
+		xsecToken: string,
+		xsecSource: string,
+	): Promise<Record<string, unknown> | null> {
+		const source = xsecSource || "pc_collect";
+		const data = await this.request("POST", "/api/sns/web/v1/feed", {
+			source_note_id: noteId,
+			image_formats: ["jpg", "webp", "avif"],
+			extra: { need_body_topic: 1 },
+			xsec_source: source,
+			xsec_token: xsecToken || "",
+		});
+		const items = data?.items as Array<Record<string, unknown>> | undefined;
+		if (!items || items.length === 0) {
+			return null;
+		}
+		const first = items[0] ?? null;
+		return (first?.note_card as Record<string, unknown>) ?? null;
+	}
+
+	/**
+	 * Merge a list card with its fetched detail. (Detail fetch is done by the
+	 * caller / pipeline; this is a thin passthrough kept for clarity.)
+	 */
+	mergeCard(card: RedNoteRaw, detail: Record<string, unknown> | null | undefined): RedNoteRaw {
+		return mergeNoteCard(card, detail);
+	}
+
+	/** Should the pagination loop continue after this page? */
+	static shouldContinue = shouldContinue;
+}
+
+/** Helper for selfinfo typing. */
+interface user_selfinfo {
+	user_id?: unknown;
+}
+
+/**
+ * Sleep helper for polite pacing between requests (1–3s per contract).
+ */
+export async function randomDelay(minMs = 1000, maxMs = 3000): Promise<void> {
+	const ms = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+	await new Promise((r) => window.setTimeout(r, ms));
+}
+
+/**
+ * Run a pipeline step with a single retry on FetchError (not on SignError /
+ * NotLoggedInError, which are terminal and should surface immediately).
+ */
+export async function withRetry<T>(
+	fn: () => Promise<T>,
+): Promise<T> {
+	try {
+		return await fn();
+	} catch (e) {
+		if (e instanceof SignError || e instanceof NotLoggedInError) {
+			throw e;
+		}
+		// One retry after a short backoff.
+		await new Promise((r) => window.setTimeout(r, 1500));
+		return fn();
+	}
+}

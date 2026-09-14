@@ -51,3 +51,12 @@
 - 登录：v1 采用**插件内嵌登录页**（隐藏 webview 加载小红书，用户扫码/输密码，会话由 webview 保持），不做粘贴 cookie 注入（httpOnly 注入实现更绕且体验差）；这同时就是参考产品的扫码登录形态
 - 取数：API 请求在 webview 内执行，签名（X-s/X-t）由小红书自身前端 JS 自动完成，规避算法更换导致的失效
 - License：**MIT**，Copyright (c) 2026 YunkaiXiao
+
+## M2 评审记录（2026-09-14）
+
+- local-reviewer 产出 4 条候选发现，Parent 裁决：
+  - #1 导航门禁绑定的 will-navigate 非可防御元素事件，门禁可能无效 → **采纳修复**：保留 new-window 拦截 + allowpopups=false，新增 did-navigate / did-navigate-in-page 事后检测非小红书域名则拉回首页
+  - #2 中途登录失效时已写盘笔记不进 syncedNoteIds，下次重复拉取覆盖 → **采纳修复**：逐篇成功写盘后增量持久化；lastSyncAt 仍仅整轮成功更新
+  - #3 登录 Modal 可重入，两个 Modal 争抢同一常驻 webview → **采纳修复**：loginModalOpen 守卫
+  - #4 syncedNoteIds 无界增长 → **延后 M3**（增量索引重做时一并处理）
+- 评审门关闭条件：3 项修复落地且 npm run build 与 npm test 均 exit 0
