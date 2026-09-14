@@ -1,0 +1,41 @@
+name: Build and Release Obsidian Plugin
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    if: "!contains(github.ref, 'alpha')"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          rm -rf release
+          mkdir release
+          cp main.js manifest.json styles.css release/
+          zip -r release.zip release
+          gh release create "$tag" \
+            --title "Obsidian RedNote Sync $tag" \
+            --notes "Release $tag" \
+            ./release.zip
+        shell: bash
