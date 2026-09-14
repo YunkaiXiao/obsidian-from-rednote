@@ -86,3 +86,12 @@
 - **来源追溯**：两种执行器写回时都更新 `ai_model`（ZCode 路径记 `zcode:<模型名>`）
 - **硬约束**：增量同步重写笔记时必须保留已有 AI 小节（只更新原文区），否则补处理成果会被清掉——该约束进 M3/M4 实现契约
 - **依赖顺序**：M3（媒体本地下载）仍是 M4 前置（视频需先落盘才能投喂模型）
+
+## ADR-010 登录白屏真正根因与修复（2026-09-15，Parent 直查）
+
+- **根因（确证）**：Electron `<webview>` 是 attribute 驱动（attributeChangedCallback）的；代码对 `src/partition/useragent/allowpopups` 全部使用 JS 属性赋值（`el.src = …`），在该版本 Electron 不反射为 attribute → **导航从未发起，webview 永远停在 about:blank**（与真机 a11y 树中 `= about:blank` 的元素、零加载日志、零报错完全吻合）。前两轮修复（display:none 停靠、显式尺寸、同步挂载）修的是真实但次要的问题，未触及此根因
+- **隐藏后果**：`partition` 同样未生效——会话隔离（`persist:rednote-sync`）此前并未真正启用
+- **修复**（Parent 直接实现，依据=用户运行时证据与实现报告矛盾）：四处改为 `setAttribute("partition"/"useragent"/"allowpopups"/"src")`；WebviewEl 类型瘦身；补 `dom-ready` 日志
+- **新增可观测性**：登录弹窗顶部一行可见状态（"正在加载小红书页面…" → "页面已加载 ✓" / "⚠ 页面加载失败（code=N）" / 10 秒看门狗提示），今后无需 DevTools 即可诊断
+- 证据：npm run build exit 0（main.js 46.7kb）、npm test 72/72
+- 部署：构建产物已复制到用户 vault（E:\Workflow）插件目录并已触发 Obsidian 重载（依据=设置窗口内容被重载清空）；最终视觉验证待用户点击（自动化通道 CUA 服务中断，中止）
