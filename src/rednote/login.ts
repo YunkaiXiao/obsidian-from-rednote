@@ -118,8 +118,11 @@ export class RedNoteLoginOverlay {
 		container.style.top = "0";
 		container.style.width = "100%";
 		container.style.height = "100%";
-		wv.style.width = "100%";
-		wv.style.height = "100%";
+		// DO NOT resize the webview itself to 100%/percentages: Electron
+		// webviews collapse to (near) zero height with percent-only sizing
+		// (documented in api.ts). The webview keeps its own explicit adaptive
+		// size (min(480px,85vw) x min(640px,70vh)) assigned at creation; the
+		// stage is sized to match, and the card auto-heights around them.
 
 		this.root = root;
 	}
