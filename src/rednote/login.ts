@@ -166,15 +166,31 @@ export class RedNoteLoginOverlay {
 			return;
 		}
 		const { w, h } = this.stageSize;
+		// Aggressive re-attach: the 4px nudge was NOT enough for a page that
+		// loaded while the overlay was visibility:hidden — the guest viewport
+		// stayed at its stale tiny size. Toggling display for a frame forces
+		// Electron to fully re-attach the guest view at the new size.
+		wv.style.display = "none";
 		wv.style.width = `${w}px`;
-		wv.style.height = `${Math.max(0, h - 4)}px`;
+		wv.style.height = `${h}px`;
 		window.setTimeout(() => {
-			wv.style.height = `${h}px`;
-			// Zoom AFTER the guest attached (setZoomFactor before load is
-			// silently ignored by Electron). 0.8 buys ~25% extra page space for
-			// the centered, non-scrolling XHS login dialog.
-			wv.setZoomFactor?.(0.8);
-		}, 60);
+			wv.style.display = "block";
+			window.setTimeout(() => {
+				// Self-check: if the ELEMENT itself did not reach the target
+				// size, say so in the status line (that would point at a CSS
+				// problem rather than a guest-sync problem).
+				const rect = wv.getBoundingClientRect();
+				if (rect.height < h - 20) {
+					this.setStatus(
+						`⚠ webview 元素仅 ${Math.round(rect.height)}px（目标 ${h}px），请反馈此行`,
+					);
+				}
+				// Zoom AFTER the guest attached (setZoomFactor before load is
+				// silently ignored by Electron). 0.8 buys ~25% extra page space
+				// for the centered, non-scrolling XHS login dialog.
+				wv.setZoomFactor?.(0.8);
+			}, 60);
+		}, 30);
 	}
 
 	private setStatus(text: string): void {
@@ -242,8 +258,11 @@ export class RedNoteLoginOverlay {
 	}
 
 	/** Poll for login success while the window is visible. */
+	private pollFailures = 0;
+
 	private startPolling(): void {
 		this.stopPolling();
+		this.pollFailures = 0;
 		const check = async (): Promise<void> => {
 			if (this.finished || !this.root || this.root.style.visibility === "hidden") {
 				return;
@@ -257,6 +276,14 @@ export class RedNoteLoginOverlay {
 					// Brief confirmation, then close (visibility only — no DOM change).
 					window.setTimeout(() => this.hide(), 800);
 					return;
+				}
+				// Surface WHY the check keeps failing so the user (and we) can
+				// see it without DevTools. Throttled to every 3rd poll.
+				this.pollFailures += 1;
+				if (this.pollFailures % 3 === 1) {
+					this.setStatus(
+						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}`,
+					);
 				}
 			} catch (e) {
 				// A signing/network hiccup while polling must not stop the

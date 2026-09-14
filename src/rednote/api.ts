@@ -488,17 +488,16 @@ export class RedNoteSession {
 			if (json.success === true) {
 				return (json.data ?? json) as Record<string, unknown>;
 			}
-			// Not-logged-in style response (selfinfo / list with no result.success)
+			// Not-logged-in style response (selfinfo / list with no result.success).
+			// Observed envelope for logged-out selfinfo is {"code":-1,"success":false}
+			// with NO msg — so treat ANY success:false on auth-checking URIs as
+			// NotLoggedInError instead of requiring a msg heuristic.
 			const isAuthy =
 				uri.includes("user/selfinfo") ||
 				uri.includes("collect/page") ||
 				uri.includes("/feed");
 			if (isAuthy && json.success === false) {
-				// Distinguish "not logged in" from other failures via msg heuristics.
-				const msg = String(json.msg ?? "");
-				if (/未登录|登录|auth|login|token/i.test(msg)) {
-					throw new NotLoggedInError(`登录已失效：${msg || "接口要求登录"}`);
-				}
+				throw new NotLoggedInError(`登录已失效：${json.msg || "接口要求登录"}`);
 			}
 			throw new FetchError(
 				`接口 ${uri} 返回失败：${json.msg ?? JSON.stringify(json).slice(0, 200)}`,
@@ -513,19 +512,43 @@ export class RedNoteSession {
 	 * Check login state via the selfinfo endpoint (verified in MediaCrawler
 	 * client.pong / query_self: success when data.result.success is true).
 	 */
+	/**
+	 * Last login-check outcome for UI surfacing (null = no recorded reason).
+	 * Cleared at the start of every checkLogin() call.
+	 */
+	lastCheckInfo: string | null = null;
+
 	async checkLogin(): Promise<boolean> {
 		// UNSIGNED first: a successful QR login was misreported as "not logged
 		// in" because the signed path died at the (optional) page sign function
 		// before the request was ever sent. selfinfo is cookie-only (pong).
+		this.lastCheckInfo = null;
 		for (const unsigned of [true, false]) {
 			try {
 				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
 				const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-				return Boolean(result && result.success === true);
+				// Tolerant response shapes: MediaCrawler documents
+				// {data:{result:{success:true,...}}}; a 2026 variant may put the
+				// user info directly under data without result.success.
+				if (result?.success === true) {
+					return true;
+				}
+				if (
+					result?.success === undefined &&
+					(result?.basic_info != null || result?.user_id != null)
+				) {
+					return true;
+				}
+				this.lastCheckInfo = "selfinfo 响应不含登录成功标记";
+				return false;
 			} catch (e) {
 				if (e instanceof NotLoggedInError) {
+					this.lastCheckInfo = e.message;
 					return false;
 				}
+				this.lastCheckInfo = `selfinfo 请求失败（unsigned=${unsigned}）：${
+					e instanceof Error ? e.message : String(e)
+				}`;
 				console.warn(
 					`[pull-rednote] checkLogin attempt (unsigned=${unsigned}) failed:`,
 					e instanceof Error ? e.message : e,

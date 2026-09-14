@@ -66,11 +66,14 @@ export default class RedNoteSyncPlugin extends Plugin {
 	private syncing = false;
 	/** Guard against re-entrant login modals fighting over one resident webview. */
 	private loginOverlay: RedNoteLoginOverlay | null = null;
+	/** Live settings tab reference so login-state changes can re-render it. */
+	private settingTab: RedNoteSyncSettingTab | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 
-		this.addSettingTab(new RedNoteSyncSettingTab(this.app, this));
+		this.settingTab = new RedNoteSyncSettingTab(this.app, this);
+		this.addSettingTab(this.settingTab);
 
 		this.addRibbonIcon("bookmark", "Pull Rednote", () => {
 			void this.runSync();
@@ -139,8 +142,9 @@ export default class RedNoteSyncPlugin extends Plugin {
 			this.settings.loginStatus = false;
 		}
 		await this.saveSettings();
-		// The settings tab re-renders from this.settings the next time it is
-		// opened; nothing further to push here.
+		// Re-render the settings tab so the login status the user is looking at
+		// reflects the new state immediately (not only on next open).
+		this.settingTab?.display();
 	}
 
 	/** The core sync command (M2). */
