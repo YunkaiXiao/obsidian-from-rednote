@@ -17,6 +17,11 @@ import { RedNoteSession } from "./api";
 
 export const LOGIN_LEAF_VIEW_TYPE = "pull-rednote-login";
 
+/** Padding (px) applied to the leaf content element in onOpen. */
+const CONTENT_PADDING_PX = 8;
+/** Fallback status-line height (px) if the real box is not measurable yet. */
+const STATUS_LINE_HEIGHT_PX = 28;
+
 export class RedNoteLoginView extends ItemView {
 	private session: RedNoteSession;
 	private onStateChange: () => void;
@@ -56,7 +61,7 @@ export class RedNoteLoginView extends ItemView {
 		contentEl.empty();
 		contentEl.style.display = "flex";
 		contentEl.style.flexDirection = "column";
-		contentEl.style.padding = "8px";
+		contentEl.style.padding = `${CONTENT_PADDING_PX}px`;
 
 		this.statusEl = contentEl.createDiv();
 		this.statusEl.style.cssText =
@@ -73,6 +78,16 @@ export class RedNoteLoginView extends ItemView {
 		const wv = this.session.ensureWebviewElement();
 		const container = wv.parentElement as HTMLElement;
 		this.stageEl.appendChild(container);
+		// Clear the offscreen PARKING styles the session set when it created
+		// the container (position:fixed; left:-99999px; 1200x800). Inline
+		// styles beat every class rule, so leaving them in place would keep
+		// the login page invisible / mis-sized inside the leaf. applySize()
+		// writes real px width/height below.
+		container.style.position = "static";
+		container.style.left = "auto";
+		container.style.top = "auto";
+		container.style.width = "";
+		container.style.height = "";
 		container.addClass("pull-rednote-login-container");
 		wv.addClass("pull-rednote-login-webview");
 
@@ -121,21 +136,38 @@ export class RedNoteLoginView extends ItemView {
 		}
 	}
 
-	/** Size the webview in integer px from the leaf's real layout box. */
+	/**
+	 * Size the webview in integer px from the leaf's REAL layout box
+	 * (this.contentEl — not the stage, whose own box can be collapsed by CSS).
+	 * Height = content box minus the status line. The result is written as
+	 * inline px to all three layers (stage, container, webview) so no CSS
+	 * rule can shrink the visible page to a thin strip.
+	 */
 	private applySize(): void {
 		const wv = this.session.getWebview();
 		if (!wv || !this.stageEl) {
 			return;
 		}
-		const box = this.stageEl.getBoundingClientRect();
-		if (box.width > 40 && box.height > 40) {
-			this.stageSize = {
-				w: Math.floor(box.width),
-				h: Math.floor(box.height),
-			};
+		const box = this.contentEl.getBoundingClientRect();
+		const statusBox = this.statusEl?.getBoundingClientRect();
+		const statusH = Math.ceil(statusBox?.height ?? STATUS_LINE_HEIGHT_PX) || STATUS_LINE_HEIGHT_PX;
+		const w = Math.floor(box.width) - CONTENT_PADDING_PX * 2;
+		const h = Math.floor(box.height) - CONTENT_PADDING_PX * 2 - statusH;
+		// Adopt the measurement only when it is a plausible box; otherwise keep
+		// the last known good (or default) size.
+		if (w > 40 && h > 40) {
+			this.stageSize = { w, h };
 		}
-		wv.style.width = `${this.stageSize.w}px`;
-		wv.style.height = `${this.stageSize.h}px`;
+		const { w: sw, h: sh } = this.stageSize;
+		this.stageEl.style.width = `${sw}px`;
+		this.stageEl.style.height = `${sh}px`;
+		const container = wv.parentElement;
+		if (container) {
+			container.style.width = `${sw}px`;
+			container.style.height = `${sh}px`;
+		}
+		wv.style.width = `${sw}px`;
+		wv.style.height = `${sh}px`;
 	}
 
 	/**
@@ -200,7 +232,15 @@ export class RedNoteLoginView extends ItemView {
 			const level = ext.level ?? ext.detail?.level;
 			const msg = ext.message ?? ext.detail?.message ?? "";
 			if (level === 3 || /error|failed|ERR_/i.test(msg)) {
-				this.setStatus(`⚠ 页面报错：${msg.slice(0, 120)}`);
+				// XHS's own page emits unrelated errors (e.g. "ReferenceError:
+				// wl is not defined"). Never clobber an already-successful
+				// status; surface noise with an explicit ignorable prefix only.
+				const current = this.statusEl?.textContent ?? "";
+				if (current.startsWith("页面已加载 ✓") || current.startsWith("登录检测")) {
+					console.log(`[pull-rednote] page console (页面噪音，可忽略): ${msg.slice(0, 120)}`);
+					return;
+				}
+				this.setStatus(`页面噪音，可忽略：${msg.slice(0, 120)}`);
 			}
 		});
 		this.watchdogTimer = window.setTimeout(() => {

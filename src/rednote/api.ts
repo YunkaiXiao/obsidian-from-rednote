@@ -25,6 +25,7 @@ import {
 } from "./types";
 import { parseListPage, shouldContinue, type RawListData } from "./pagination";
 import { mergeNoteCard } from "./extract";
+import { xhsSign, generateB1, xhsQueryEscape } from "./sign";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
@@ -336,28 +337,84 @@ export class RedNoteSession {
 	}
 
 	/**
-	 * Generate signed request headers by invoking XHS's own page JS.
+	 * Generate signed request headers.
 	 *
-	 * Community-documented function is `window._webmsxyw`. We also try a small
-	 * set of known alternate signatures in case the symbol was renamed. If none
-	 * is present we throw SignError (caller shows a Notice, no silent failure).
+	 * Preferred path (2026): pure LOCAL signing (see ./sign.ts, the algorithm
+	 * MediaCrawler uses via xhshow). Verified 2026-09 that the XHS page no
+	 * longer exposes window._webmsxyw & al., so the page-function probe below
+	 * is only a FALLBACK.
+	 *
+	 * Inputs:
+	 *  - a1: read from document.cookie inside the webview (set even logged-out).
+	 *  - b1: in a real XHS page b1 lives in localStorage.getItem("b1") (see
+	 *    MediaCrawler help.py comments), NOT in cookies. We read it from
+	 *    localStorage; if absent (page not ready / fresh partition) we synthesize
+	 *    one locally exactly the way MediaCrawler's xhshow library does.
 	 */
 	async getSign(
 		method: "GET" | "POST",
 		uri: string,
 		data: Record<string, unknown> | null,
 	): Promise<RedNoteSign> {
-		// Build a small, self-contained JS snippet that locates XHS's own
-		// signing function and produces the four signed headers.
-		//
-		// ASSUMPTION (NEEDS_VERIFICATION): the page exposes a signing function
-		// callable as fn(uri, data) returning { x-s, x-t, x-s-common,
-		// x-b3-traceid } — the community-documented symbol is window._webmsxyw
-		// (see MediaCrawler + community notes). We try a small set of likely
-		// symbol names; if none yields a valid signature we throw SignError
-		// (the caller shows a Notice — no silent failure), per the contract.
-		// The exact call signature (and whether GET/POST differ) is not
-		// confirmed without a logged-in XHS session and must be re-checked.
+		// (1) Best-effort cookie/localStorage read inside the page context.
+		let a1 = "";
+		let b1 = "";
+		try {
+			const raw = await this.eval<string>(`(() => {
+				let a1 = "";
+				const m = document.cookie.match(/(?:^|; )a1=([^;]*)/);
+				if (m) { try { a1 = decodeURIComponent(m[1]); } catch (e) { a1 = m[1]; } }
+				let b1v = "";
+				try { b1v = (window.localStorage && window.localStorage.getItem("b1")) || ""; } catch (e) {}
+				return JSON.stringify({ a1: a1, b1: b1v });
+			})()`);
+			const p = raw ? (JSON.parse(raw) as { a1?: unknown; b1?: unknown }) : null;
+			if (p) {
+				if (typeof p.a1 === "string") a1 = p.a1;
+				if (typeof p.b1 === "string") b1 = p.b1;
+			}
+		} catch (e) {
+			console.warn(
+				"[pull-rednote] cookie/b1 read failed:",
+				e instanceof Error ? e.message : e,
+			);
+		}
+
+		// (2) LOCAL signing (primary).
+		if (a1) {
+			try {
+				const sign = xhsSign(uri, method, data, a1, b1 || generateB1());
+				return sign;
+			} catch (e) {
+				console.warn(
+					"[pull-rednote] local sign failed:",
+					e instanceof Error ? e.message : e,
+				);
+			}
+		} else {
+			console.warn("[pull-rednote] no a1 cookie in webview page; local sign unavailable");
+		}
+
+		// (3) Fallback: probe XHS's own page signing function (legacy path).
+		const legacy = await this.tryPageSign(method, uri, data);
+		if (legacy) {
+			return legacy;
+		}
+		throw new SignError(
+			"本地与页面签名均不可用：无法读取 a1 cookie 且页面无签名函数。请重新打开登录窗口并确认页面完全加载后再同步。",
+		);
+	}
+
+	/**
+	 * Legacy fallback: invoke XHS's own page JS signing function
+	 * (community-documented as window._webmsxyw, plus a few renamed variants).
+	 * Absent on 2026 pages, but harmless to try and keeps a second opinion.
+	 */
+	private async tryPageSign(
+		method: "GET" | "POST",
+		uri: string,
+		data: Record<string, unknown> | null,
+	): Promise<RedNoteSign | null> {
 		const payload = JSON.stringify(data ?? {});
 		const code = `
 			(() => {
@@ -394,14 +451,19 @@ export class RedNoteSession {
 				return JSON.stringify(null);
 			})()
 		`;
-		const result = await this.eval<string | null>(code);
-		const parsed = result ? JSON.parse(result) : null;
-		if (!parsed || !parsed["X-S"] || !parsed["X-T"]) {
-			throw new SignError(
-				"无法在页面中定位小红书签名函数（window._webmsxyw 等），签名不可用。请重新打开登录窗口并确认页面完全加载后再同步。",
+		try {
+			const result = await this.eval<string | null>(code);
+			const parsed = result ? JSON.parse(result) : null;
+			if (parsed && parsed["X-S"] && parsed["X-T"]) {
+				return parsed as RedNoteSign;
+			}
+		} catch (e) {
+			console.warn(
+				"[pull-rednote] page sign probe failed:",
+				e instanceof Error ? e.message : e,
 			);
 		}
-		return parsed;
+		return null;
 	}
 
 	/**
@@ -434,9 +496,10 @@ export class RedNoteSession {
 			headers["X-B3-Traceid"] = sign["X-B3-Traceid"];
 		}
 
-		// Build the full URL. For GET, the query string must be encoded the same
-		// way the sign was computed (browser behavior, commas not encoded) to
-		// match MediaCrawler's _build_query_string.
+		// Build the full URL. For GET, the query string MUST be encoded exactly
+		// like the signed content string (xhsQueryEscape = Python
+		// quote(safe=",")) or the server reconstructs a different string and
+		// rejects the signature. This matches MediaCrawler's _build_query_string.
 		let fullUrl = HOST + uri;
 		const body: string | undefined =
 			method === "POST" && data ? JSON.stringify(data) : undefined;
@@ -448,7 +511,7 @@ export class RedNoteSession {
 		};
 		if (method === "GET" && data) {
 			const qs = Object.entries(data)
-				.map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
+				.map(([k, v]) => `${k}=${xhsQueryEscape(String(v))}`)
 				.join("&");
 			fullUrl = `${fullUrl}?${qs}`;
 		} else if (method === "POST" && body !== undefined) {
@@ -532,15 +595,26 @@ export class RedNoteSession {
 			const keys = Object.keys(user);
 			const hasUserData = keys.length > 0 && JSON.stringify(user).length > 10;
 			const cookieA1 = /(?:^|; )a1=/.test(document.cookie);
-			return JSON.stringify({ hasUserData, userKeys: keys.slice(0, 6).join(","), cookieA1 });
+			const stateKeys = Object.keys(st).slice(0, 12).join(",");
+			return JSON.stringify({ hasUserData, userKeys: keys.slice(0, 6).join(","), cookieA1, stateKeys });
 		})()`;
 		try {
 			const raw = await this.eval<string>(code);
-			const p = raw ? (JSON.parse(raw) as { hasUserData?: boolean; userKeys?: string; cookieA1?: boolean }) : null;
+			const p = raw
+				? (JSON.parse(raw) as {
+						hasUserData?: boolean;
+						userKeys?: string;
+						cookieA1?: boolean;
+						stateKeys?: string;
+					})
+				: null;
 			if (!p) {
 				return { ok: false, info: "页面探测无返回" };
 			}
-			const info = `页面侧 INITIAL_STATE.user=${p.userKeys || "无"}，a1=${p.cookieA1 ? "有" : "无"}`;
+			const stateKeys = (p.stateKeys ?? "").slice(0, 80);
+			const info =
+				`页面侧 INITIAL_STATE.user=${p.userKeys || "无"}，a1=${p.cookieA1 ? "有" : "无"}` +
+				`，state keys=${stateKeys || "无"}`;
 			return { ok: Boolean(p.hasUserData), info };
 		} catch (e) {
 			return { ok: false, info: `页面探测失败：${e instanceof Error ? e.message : String(e)}` };
