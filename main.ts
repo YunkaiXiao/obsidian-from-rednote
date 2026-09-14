@@ -12,6 +12,13 @@ import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
+import {
+	evaluateRateLimit,
+	normalizeRateLimitState,
+	parseRateLimitConfig,
+	recordProcessed,
+	type RateLimitState,
+} from "./src/rednote/ratelimit";
 
 export interface RedNoteSyncSettings {
 	loginStatus: boolean;
@@ -26,6 +33,12 @@ export interface RedNoteSyncSettings {
 	syncedNoteIds: string[];
 	/** ISO 8601 of the last successful sync. */
 	lastSyncAt: string;
+	/** Rate limit (feature #14): max notes processed per window. */
+	rateLimitMaxNotes: number;
+	/** Rate limit: window length in minutes. */
+	rateLimitWindowMinutes: number;
+	/** Rate limit: persisted window budget state (survives restarts). */
+	rateLimitState: RateLimitState | null;
 }
 
 const DEFAULT_SETTINGS: RedNoteSyncSettings = {
@@ -39,6 +52,9 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	mediaFolder: "RedNote/Media",
 	syncedNoteIds: [],
 	lastSyncAt: "",
+	rateLimitMaxNotes: 20,
+	rateLimitWindowMinutes: 10,
+	rateLimitState: null,
 };
 
 /** XHS publish/collect times are rendered in +08:00 (see extract.ts). */
@@ -56,13 +72,13 @@ export default class RedNoteSyncPlugin extends Plugin {
 
 		this.addSettingTab(new RedNoteSyncSettingTab(this.app, this));
 
-		this.addRibbonIcon("bookmark", "RedNote Sync", () => {
+		this.addRibbonIcon("bookmark", "Pull Rednote", () => {
 			void this.runSync();
 		});
 
 		this.addCommand({
 			id: "sync-rednote-favorites",
-			name: "同步小红书收藏",
+			name: "Pull Rednote：同步收藏笔记",
 			callback: () => {
 				void this.runSync();
 			},
@@ -70,7 +86,7 @@ export default class RedNoteSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "rednote-open-login",
-			name: "小红书：打开登录窗口",
+			name: "Pull Rednote：打开登录窗口",
 			callback: () => {
 				this.openLogin();
 			},
@@ -139,7 +155,7 @@ export default class RedNoteSyncPlugin extends Plugin {
 
 		// Gate 1: login. (If never logged in, guide to the login modal.)
 		if (!this.settings.loginStatus) {
-			new Notice("尚未登录小红书，请先打开「小红书：打开登录窗口」登录", 8000);
+			new Notice("尚未登录小红书，请先打开「Pull Rednote：打开登录窗口」登录", 8000);
 			return;
 		}
 		// Gate 2: confirm the session is actually still valid (the webview may
@@ -162,6 +178,23 @@ export default class RedNoteSyncPlugin extends Plugin {
 		const syncedSet = new Set(this.settings.syncedNoteIds);
 		// note_ids written during this run; persisted incrementally below.
 		const newIds = new Set<string>();
+
+		// Rate limit state (feature #14): loaded from data.json so a restart
+		// does NOT reset the budget; an expired window resets it naturally.
+		const rateCfg = parseRateLimitConfig(
+			this.settings.rateLimitMaxNotes,
+			this.settings.rateLimitWindowMinutes,
+		);
+		let rateState: RateLimitState =
+			normalizeRateLimitState(this.settings.rateLimitState) ?? {
+				windowStart: Date.now(),
+				notesInWindow: 0,
+			};
+		const persistRateState = (): Promise<void> => {
+			this.settings.rateLimitState = rateState;
+			return this.saveSettings();
+		};
+
 		try {
 			const result = await syncFavorites(this.app.vault, this.session, {
 				notesFolder: this.settings.notesFolder,
@@ -169,6 +202,25 @@ export default class RedNoteSyncPlugin extends Plugin {
 				syncedNoteIds: syncedSet,
 				onPage: (page: number) => {
 					new Notice(`正在同步第 ${page} 页…`);
+				},
+				// Called before each NEW note's detail fetch. When the window
+				// budget is exhausted, show the Notice and wait out the window,
+				// then continue automatically. runSync already runs as a
+				// background async task; closing Obsidian is the cancel path.
+				acquireNoteSlot: async () => {
+					for (;;) {
+						const decision = evaluateRateLimit(rateState, rateCfg, Date.now());
+						rateState = decision.state;
+						if (decision.action === "allow") {
+							return;
+						}
+						const minutes = Math.max(1, Math.ceil(decision.waitMs / 60_000));
+						new Notice(`已达限速上限，${minutes} 分钟后自动继续`, 8000);
+						await persistRateState();
+						await new Promise<void>((resolve) =>
+							window.setTimeout(resolve, decision.waitMs),
+						);
+					}
 				},
 				onNotePersisted: (noteId: string) => {
 					// Persist the id the instant its .md is on disk, so a mid-run
@@ -179,7 +231,10 @@ export default class RedNoteSyncPlugin extends Plugin {
 					newIds.add(noteId);
 					syncedSet.add(noteId);
 					this.settings.syncedNoteIds = Array.from(syncedSet);
-					return this.saveSettings();
+					// A fully processed note (detail fetch + write) counts
+					// against the current rate limit window.
+					rateState = recordProcessed(rateState, rateCfg, Date.now());
+					return persistRateState();
 				},
 			});
 
@@ -247,6 +302,42 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("上次同步")
 			.setDesc(settings.lastSyncAt || "（尚未同步）");
+
+		new Setting(containerEl)
+			.setName("限速：每窗口笔记数")
+			.setDesc("每个时间窗口内最多处理的笔记数（按详情拉取+写盘计），防止触发风控")
+			.addText((text: TextComponent) => {
+				text.inputEl.type = "number";
+				text
+					.setPlaceholder("20")
+					.setValue(String(settings.rateLimitMaxNotes))
+					.onChange(async (value: string) => {
+						const parsed = Number(value);
+						settings.rateLimitMaxNotes =
+							Number.isFinite(parsed) && parsed > 0
+								? Math.floor(parsed)
+								: 20;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("限速：窗口时长（分钟）")
+			.setDesc("限速窗口长度；达到上限后等待到窗口结束自动继续，重启 Obsidian 不重置预算")
+			.addText((text: TextComponent) => {
+				text.inputEl.type = "number";
+				text
+					.setPlaceholder("10")
+					.setValue(String(settings.rateLimitWindowMinutes))
+					.onChange(async (value: string) => {
+						const parsed = Number(value);
+						settings.rateLimitWindowMinutes =
+							Number.isFinite(parsed) && parsed > 0
+								? parsed
+								: 10;
+						await this.plugin.saveSettings();
+					});
+			});
 
 		new Setting(containerEl)
 			.setName("启用 AI 视频转写与图片分析")

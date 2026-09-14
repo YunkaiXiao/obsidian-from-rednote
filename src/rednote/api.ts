@@ -96,8 +96,12 @@ export class FetchError extends Error {
  * Owns the resident webview, login state, and the signed data pipeline.
  *
  * The webview is created on first use and is NEVER removed from the DOM
- * (only hidden via display:none). Removing it would drop the session and
- * require a re-login. `destroy()` removes it only on plugin unload.
+ * (parked offscreen via position:fixed as a direct child of document.body).
+ * Removing it would drop the session and require a re-login. `destroy()`
+ * removes it only on plugin unload. The login modal borrows the container
+ * temporarily and MUST re-parent it back to document.body in its onClose()
+ * (see RedNoteLoginModal): Obsidian may detach the modal DOM after close,
+ * and a webview left inside that subtree would be destroyed with it.
  */
 export class RedNoteSession {
 	private container: HTMLElement | null = null;
@@ -109,20 +113,50 @@ export class RedNoteSession {
 	 * Idempotent: returns the existing (ready) webview if one is present.
 	 *
 	 * The webview is mounted in a container attached to `document` and kept
-	 * alive via display:none so the browser session (cookies + page JS)
+	 * alive (hidden offscreen) so the browser session (cookies + page JS)
 	 * persists across sync runs.
 	 */
 	ensureWebview(): Promise<WebviewEl> {
-		if (this.webview && this.readyPromise) {
-			return this.readyPromise.then(() => this.webview as WebviewEl);
+		this.ensureWebviewElement();
+		return this.readyPromise!.then(() => this.webview as WebviewEl);
+	}
+
+	/**
+	 * Synchronously create and mount the resident webview if it does not exist
+	 * yet, WITHOUT waiting for the page to load. The login modal needs this so
+	 * it can show the (sized) webview box immediately instead of an empty white
+	 * modal for as long as the XHS homepage takes to load (bounded by the 30s
+	 * safety timeout below). `ensureWebview()` still awaits load readiness for
+	 * the data pipeline.
+	 */
+	ensureWebviewElement(): WebviewEl {
+		if (this.webview) {
+			return this.webview;
 		}
 		const el = document.createElement("webview") as WebviewEl;
+		// CRITICAL: partition MUST be set before the webview is attached / has a
+		// src — it selects the session to load into, and once the element starts
+		// loading with the default (isolated) session the login won't persist.
+		// (Order verified: partition/UA/size -> appendChild -> src below.)
 		el.partition = WEBVIEW_PARTITION;
 		el.userAgent = CHROME_UA;
 		el.allowpopups = false;
+		// CRITICAL: the webview element has NO reliable default size — with only
+		// percent/100% sizing it collapses to 0 (or 300x300) when reparented into
+		// a modal content box that has no fixed height of its own, which is what
+		// made the login modal render all-white. Give it an explicit px size.
+		el.style.width = "480px";
+		el.style.height = "640px";
+		el.style.display = "block";
+		el.style.border = "none";
 
 		const container = document.createElement("div");
-		container.style.display = "none";
+		// CRITICAL (white-screen root cause): do NOT hide the container with
+		// display:none. A <webview> created (and src'd) inside a display:none
+		// subtree gets a 0x0 guest view that never re-lays-out after the
+		// container is reparented into the login modal — the guest stays
+		// unrendered and the modal shows an all-white box. Hide it offscreen
+		// with position:fixed instead so the guest always has a real layout.
 		container.style.position = "fixed";
 		container.style.left = "-99999px";
 		container.style.top = "0";
@@ -133,6 +167,46 @@ export class RedNoteSession {
 
 		this.container = container;
 		this.webview = el;
+
+		// Load observability: surface the webview's loading lifecycle in the
+		// developer console so a real-device white screen can be diagnosed
+		// without guessing (start/stop, failure codes, guest console output).
+		el.addEventListener("did-start-loading", () => {
+			console.log("[pull-rednote] webview did-start-loading");
+		});
+		el.addEventListener("did-stop-loading", () => {
+			console.log("[pull-rednote] webview did-stop-loading");
+		});
+		el.addEventListener("did-fail-load", (e: Event) => {
+			// Electron exposes these fields directly on the event; some builds
+			// wrap them in detail — read both defensively.
+			const ext = e as Event & {
+				errorCode?: number;
+				errorDescription?: string;
+				validatedURL?: string;
+				isMainFrame?: boolean;
+				detail?: { errorCode?: number; errorDescription?: string; validatedURL?: string; isMainFrame?: boolean };
+			};
+			const code = ext.errorCode ?? ext.detail?.errorCode;
+			const desc = ext.errorDescription ?? ext.detail?.errorDescription;
+			const url = ext.validatedURL ?? ext.detail?.validatedURL;
+			const main = ext.isMainFrame ?? ext.detail?.isMainFrame;
+			console.log(
+				`[pull-rednote] webview did-fail-load code=${code} desc=${desc} url=${url} isMainFrame=${main}`,
+			);
+		});
+		el.addEventListener("console-message", (e: Event) => {
+			const ext = e as Event & {
+				message?: string;
+				lineNumber?: number;
+				sourceId?: string;
+				detail?: { message?: string; lineNumber?: number; sourceId?: string };
+			};
+			const msg = ext.message ?? ext.detail?.message;
+			const line = ext.lineNumber ?? ext.detail?.lineNumber;
+			const src = ext.sourceId ?? ext.detail?.sourceId;
+			console.log(`[pull-rednote] webview console: ${msg} (${src ?? ""}:${line ?? ""})`);
+		});
 
 		// Navigation sandbox (see note below): keep the webview confined to XHS
 		// domains. This is a best-effort hardening against open-redirect style
@@ -187,13 +261,24 @@ export class RedNoteSession {
 
 		this.readyPromise = new Promise<void>((resolve) => {
 			el.addEventListener("did-finish-load", () => resolve(), { once: true });
+			// A failed MAIN-frame load never reaches did-finish-load; resolve
+			// anyway so callers fail fast with a clear sign/fetch error instead
+			// of hanging for the full safety timeout. Subframe failures (ads,
+			// trackers) must not resolve readiness.
+			el.addEventListener("did-fail-load", (e: Event) => {
+				const ext = e as Event & { isMainFrame?: boolean; detail?: { isMainFrame?: boolean } };
+				const main = ext.isMainFrame ?? ext.detail?.isMainFrame;
+				if (main !== false) {
+					resolve();
+				}
+			});
 			// Safety: resolve even if the event never fires (e.g. blocked nav),
 			// after a bounded wait, so callers don't hang forever.
 			window.setTimeout(() => resolve(), 30000);
 		});
 
 		el.src = INDEX_URL;
-		return this.readyPromise.then(() => el);
+		return el;
 	}
 
 	/** The resident webview element (or null if never created). */

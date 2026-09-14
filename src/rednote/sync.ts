@@ -34,6 +34,13 @@ export interface SyncOptions {
 	 * already written are not re-fetched / overwritten on the next run.
 	 */
 	onNotePersisted?: (noteId: string) => Promise<void> | void;
+	/**
+	 * Rate-limit gate (feature #14), called before each NEW note's detail
+	 * fetch. Resolves when processing may proceed; the implementation (main
+	 * layer) owns the wait/Notice/persistence side effects and may therefore
+	 * resolve late (after the rate-limit window rolls over).
+	 */
+	acquireNoteSlot?: () => Promise<void>;
 }
 
 export interface SyncResult {
@@ -123,8 +130,12 @@ export async function syncFavorites(
 				result.skipped += 1;
 				continue;
 			}
-			// 3. Fetch the detail, then render + write.
+			// 3. Fetch the detail, then render + write. The rate-limit gate runs
+			//    first so a note only starts while the window budget allows it.
 			try {
+				if (opts.acquireNoteSlot) {
+					await opts.acquireNoteSlot();
+				}
 				const detail = await withRetry(() =>
 					session.fetchNoteDetail(
 						card.note_id,

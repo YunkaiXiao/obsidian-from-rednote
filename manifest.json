@@ -1,6 +1,6 @@
 {
 	"id": "obsidian-from-rednote",
-	"name": "RedNote Sync",
+	"name": "Pull Rednote",
 	"version": "0.1.0",
 	"minAppVersion": "1.4.0",
 	"description": "把小红书收藏的笔记同步到本地 Obsidian 仓库（Vault），支持 AI 视频转写与图片分析",

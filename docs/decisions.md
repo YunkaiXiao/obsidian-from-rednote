@@ -60,3 +60,18 @@
   - #3 登录 Modal 可重入，两个 Modal 争抢同一常驻 webview → **采纳修复**：loginModalOpen 守卫
   - #4 syncedNoteIds 无界增长 → **延后 M3**（增量索引重做时一并处理）
 - 评审门关闭条件：3 项修复落地且 npm run build 与 npm test 均 exit 0
+
+## ADR-008 真机验证第一轮：登录白屏缺陷 + 限速需求 + 改名（2026-09-15，用户反馈）
+
+- 真机结果（Obsidian 1.13.7）：点击「打开登录窗口」后 Modal 弹出但**内部全白、无任何交互内容**（仅 × 关闭按钮），弹窗约 560×130px；同步未测（因未登录）。登记为用户真机复现的缺陷
+- 待排查方向（代码级）：登录容器隐藏期样式（position:fixed/left:-99999px）移入 Modal 时未清除；webview src 设置时机（须先挂载 DOM 再设 src）；Modal/webview 缺少显式尺寸
+- 新需求①限速：每时间窗口最多同步 N 篇笔记，**N 与窗口时长均可在设置中调整**（默认窗口 10 分钟），防 bot 检测；窗口状态持久化，重启后不重置预算
+- 新需求②改名：显示名 RedNote Sync → **Pull Rednote**（与他人插件重名）；插件 id 保持 `obsidian-from-rednote` 不变（保留 data.json 数据连续性），用户可见文案全部更名
+
+### ADR-008 追记：修复轮结论（2026-09-15）
+
+- 白屏根因（代码级确认）：①常驻容器 `display:none` 停靠 → webview 以 0×0 布局创建，移入 Modal 后不重排（主因）；②登录 onOpen `await` 完整页面加载才挂载（首开被 30s 门控卡白）；③高度塌陷（容器 height:100% 对 min-height 不解析 + webview 无显式尺寸）。修复：position:fixed 离屏停靠、onOpen 同步挂载（新增 ensureWebviewElement）、Modal 540×720 / webview 480×640、加载事件打 `[pull-rednote]` 前缀日志、主框架 did-fail-load 提前 settle
+- 第二轮评审 1 条采纳并已修：登录 Modal `onClose` 未把容器 reparent 回 `document.body`（框架若卸载 modal DOM 会连带销毁 webview，"关窗后会话保持"失效）→ onClose 先挂回 body 再套离屏样式；其余核查通过（M2 三项修复无回归、限速语义正确、改名完备、partition 串保持不变维持会话）
+- 限速实现：纯函数 ratelimit 模块 + 15 单测；设置默认 20 篇 / 10 分钟，状态持久化跨重启
+- 证据：npm run build exit 0（main.js 44.6kb）、npm test 72/72 通过
+- 状态：待用户真机复测——登录弹窗渲染、关窗后直接同步的会话保持、限速等待与自动续传
