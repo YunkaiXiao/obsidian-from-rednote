@@ -33,3 +33,15 @@
 - frontmatter 基线：`resourceId, author, link, tags, category, timestamp` + 扩展 `ai`/`ai_model`
 - 目录基线：`RedNote/Bookmarks/《标题》.md`，图片存 `RedNote/Media/{postId}/`（.webp）
 - 格式改进建议（时间戳拆分、tags 命名空间、collection 字段等）讨论中，采纳项记入 ADR-006
+
+## ADR-006 格式改进（2026-09-14，用户确认，七项全采纳）
+
+- 时间戳一拆三：`created_at`（发布）/ `collected_at`（收藏）/ `synced_at`（同步），ISO 8601 格式
+- tags 命名空间：**方案 a——默认前缀 `xhs/`**（如 `xhs/咖啡`），设置中可修改前缀或关闭
+- 新增 `collection`：记录笔记所在的小红书收藏夹（分组）
+- `author` 拆平：`author` / `author_id` / `author_link`
+- 新增 `type: video | image`（图文/视频笔记）
+- 文件名处理：同题冲突自动追加 note_id 后 4 位；清洗 Windows 非法字符
+- AI 字段：`ai_model` + `ai_sections` 列表（transcript / image_analysis），比单一布尔表达力强
+- 字段命名：参考产品的 `resourceId` 更名为 `note_id`
+- 完整模板见 `docs/note-template.md`
