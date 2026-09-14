@@ -118,11 +118,12 @@ export default class RedNoteSyncPlugin extends Plugin {
 		// webview element, which is fine: the login session persists in the
 		// partition and is lazily recreated for signed sync requests.
 		const existing = this.app.workspace.getLeavesOfType(LOGIN_LEAF_VIEW_TYPE);
-		const leaf = existing.length > 0 ? existing[0] : this.app.workspace.getLeaf(true);
-		if (existing.length > 0) {
-			this.app.workspace.setActiveLeaf(leaf);
+		const openLeaf = existing.length > 0 ? existing[0] : undefined;
+		if (openLeaf) {
+			this.app.workspace.setActiveLeaf(openLeaf);
 			return;
 		}
+		const leaf = this.app.workspace.getLeaf(true);
 		const view = new RedNoteLoginView(leaf, this.session, () => {
 			void this.updateLoginState(true);
 		});
