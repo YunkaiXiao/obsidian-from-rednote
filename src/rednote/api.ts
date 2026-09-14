@@ -139,13 +139,14 @@ export class RedNoteSession {
 		// session the login cookies will live in.
 		el.setAttribute("partition", WEBVIEW_PARTITION);
 		el.setAttribute("useragent", CHROME_UA);
-		el.setAttribute("allowpopups", "false");
-		// CRITICAL: the webview element has NO reliable default size — with only
-		// percent/100% sizing it collapses to 0 (or 300x300) when reparented into
-		// a modal content box that has no fixed height of its own, which is what
-		// made the login modal render all-white. Give it an explicit px size.
-		el.style.width = "480px";
-		el.style.height = "640px";
+		// NOTE: allowpopups is intentionally NOT set. Electron treats boolean
+		// webview attributes by PRESENCE (any value, including "false", means
+		// enabled), so setAttribute("allowpopups", "false") would have been
+		// inverted. Absent = popups disabled, which is what we want.
+		// Adaptive size: cap to the host window so the login page always fits
+		// (small Obsidian windows used to crop the QR code area).
+		el.style.width = "min(480px, 85vw)";
+		el.style.height = "min(640px, 70vh)";
 		el.style.display = "block";
 		el.style.border = "none";
 
@@ -235,12 +236,24 @@ export class RedNoteSession {
 		//     (If a build does emit a cancellable will-navigate we still listen
 		//     for it and preventDefault as a bonus — it never fires on the
 		//     standard element, so it is harmless.)
+		// Pull the frame back home ONLY on a deferred, rate-limited schedule:
+		// calling loadURL() synchronously inside a navigation event callback can
+		// trip Chromium CHECK assertions in the host process (observed as an
+		// 0x80000003 APPCRASH of Obsidian.exe right after the login page loaded).
+		let lastBackHome = 0;
 		const forceBackHome = () => {
-			if (typeof el.loadURL === "function") {
-				el.loadURL(INDEX_URL);
-			} else {
-				el.setAttribute("src", INDEX_URL);
+			const now = Date.now();
+			if (now - lastBackHome < 1500) {
+				return;
 			}
+			lastBackHome = now;
+			window.setTimeout(() => {
+				if (typeof el.loadURL === "function") {
+					el.loadURL(INDEX_URL);
+				} else {
+					el.setAttribute("src", INDEX_URL);
+				}
+			}, 250);
 		};
 		const watchNavigation = (name: string, cancellable: boolean) => {
 			el.addEventListener(name, (e: Event) => {

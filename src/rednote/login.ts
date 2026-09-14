@@ -71,6 +71,20 @@ export class RedNoteLoginModal extends Modal {
 		attach("dom-ready", () => setStatus("页面已加载 ✓"));
 		attach("did-stop-loading", () => setStatus("页面已加载 ✓"));
 		attach("did-fail-load", onFail);
+		// Surface guest-page errors (e.g. QR endpoint failures) in the status
+		// line so they are diagnosable without opening DevTools.
+		attach("console-message", (e: Event): void => {
+			const ext = e as Event & {
+				level?: number;
+				message?: string;
+				detail?: { level?: number; message?: string };
+			};
+			const level = ext.level ?? ext.detail?.level;
+			const msg = ext.message ?? ext.detail?.message ?? "";
+			if (level === 3 || /error|failed|ERR_/i.test(msg)) {
+				setStatus(`⚠ 页面报错：${msg.slice(0, 120)}`);
+			}
+		});
 		this.watchdogTimer = window.setTimeout(() => {
 			status.setText("⚠ 10 秒内页面仍未加载，webview 可能未启动，请把此行反馈给开发者");
 		}, 10000);
@@ -78,10 +92,12 @@ export class RedNoteLoginModal extends Modal {
 		// Explicit modal size: the webview itself has fixed px size (480x640,
 		// see ensureWebviewElement); give contentEl a definite height too, so
 		// the container's percentage sizes resolve instead of collapsing to 0.
-		contentEl.style.width = "540px";
-		contentEl.style.height = "720px";
-		contentEl.style.minWidth = "540px";
-		contentEl.style.minHeight = "720px";
+		// Adaptive modal size: big enough for the XHS login page, but capped by
+		// the Obsidian window so the QR area is never cropped in small windows.
+		contentEl.style.width = "min(540px, 90vw)";
+		contentEl.style.height = "min(720px, 80vh)";
+		contentEl.style.minWidth = "min(540px, 90vw)";
+		contentEl.style.minHeight = "min(720px, 80vh)";
 
 		// Move the webview into the modal so the user can interact with it,
 		// and CLEAR the offscreen parking styles from the move-in path.
