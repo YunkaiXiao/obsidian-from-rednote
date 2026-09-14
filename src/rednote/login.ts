@@ -78,15 +78,26 @@ export class RedNoteLoginView extends ItemView {
 		container.style.width = "100%";
 		container.style.height = "100%";
 
-		// Layout settles asynchronously — size and kick on the next frames.
-		window.setTimeout(() => {
-			this.applySize();
-			this.kickGuestResize();
-		}, 50);
+		// Leaf layout settles asynchronously (and re-settles on popout/resize).
+		// A single 50ms probe measured a pre-layout box and left the webview at
+		// its default ~480px size in the corner of a large leaf. Retry on
+		// several early ticks and on every workspace resize (onResize below).
+		for (const delay of [50, 200, 600, 1500]) {
+			window.setTimeout(() => {
+				this.applySize();
+				this.kickGuestResize();
+			}, delay);
+		}
 
 		this.attachStatus();
 		this.startPolling();
 		void this.session.ensureWebview();
+	}
+
+	/** Workspace calls this whenever the leaf (or its popout window) resizes. */
+	onResize(): void {
+		this.applySize();
+		this.kickGuestResize();
 	}
 
 	async onClose(): Promise<void> {
