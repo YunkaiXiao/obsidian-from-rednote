@@ -1,78 +1,162 @@
-// Side-effect module: the embedded login Modal.
+// Self-managed persistent login overlay (NOT an Obsidian Modal).
 //
-// The Modal MOVES the session's resident webview into the modal's content
-// area (so the user can see the QR / password form) and then RESTORES it on
-// close by RE-parenting its container back to document.body and parking it
-// offscreen there (position:fixed). Reparenting back is mandatory: Obsidian
-// may detach the modal DOM after onClose, and a webview left inside it would
-// be torn down with it, dropping the browser session. Because the same
-// webview element is reused (never re-created / removed), the session
-// persists across login + sync. A poll loop watches login state while the
-// modal is open and reports success.
+// Rationale (ADR-012): Electron has a documented crash class where moving or
+// removing a live <webview> inside a close callback crashes the HOST process
+// (0x80000003 APPCRASH — observed 3x on Obsidian 1.13.7 when our old
+// Modal-based login reparented the webview container in onClose; matches
+// Electron fixed issues #38996 / #38603). Surfing — the community reference
+// for embedding pages in Obsidian — never hosts webviews in Modals and never
+// reparents live webview nodes.
+//
+// Therefore this login "window" is a plain div attached to document.body for
+// the WHOLE plugin lifetime. Open/close only toggles visibility CSS: the DOM
+// structure never changes and the webview is never reparented or removed
+// (until plugin unload). Hiding uses visibility:hidden (NOT display:none,
+// which collapses the Electron guest layout — see the earlier white screen).
 
-import { Modal, Notice } from "obsidian";
+import { Notice } from "obsidian";
 import { RedNoteSession } from "./api";
 
-export class RedNoteLoginModal extends Modal {
+export class RedNoteLoginOverlay {
 	private session: RedNoteSession;
 	private onResult: (logged: boolean) => void;
-	private pollTimer: number | null = null;
-	private finished = false;
-	/** Load-status wiring (visible line in the modal + cleanup on close). */
+	private root: HTMLElement | null = null;
+	private statusEl: HTMLElement | null = null;
 	private statusHandlers: Array<[string, EventListener]> = [];
 	private watchdogTimer: number | null = null;
+	private pollTimer: number | null = null;
+	private finished = false;
 
-	/**
-	 * @param app       Obsidian app.
-	 * @param session   The shared resident-webview session.
-	 * @param onResult  Called when login is confirmed or the modal closes.
-	 */
-	constructor(app: import("obsidian").App, session: RedNoteSession, onResult: (logged: boolean) => void) {
-		super(app);
+	constructor(session: RedNoteSession, onResult: (logged: boolean) => void) {
 		this.session = session;
 		this.onResult = onResult;
 	}
 
-	onOpen(): void {
-		const contentEl = this.contentEl;
-		contentEl.empty();
-		contentEl.classList.add("rednote-login-modal");
+	/** Show the login window (idempotent; builds the DOM exactly once). */
+	show(): void {
+		if (!this.root) {
+			this.build();
+		}
+		this.finished = false;
+		(this.root as HTMLElement).style.visibility = "visible";
+		this.attachStatus();
+		this.startPolling();
+		// Kick off / await the page load (no-op when already loaded).
+		void this.session.ensureWebview();
+	}
 
-		// CRITICAL (white-screen fix): create/mount the webview SYNCHRONOUSLY,
-		// before any await, so the modal immediately shows a sized box. The
-		// previous code did `await session.ensureWebview()` first, which waits
-		// for the XHS homepage to finish loading (up to a 30s safety cap) and
-		// left the freshly opened modal completely blank in the meantime.
-		const wv = this.session.ensureWebviewElement();
-		const container = wv.parentElement;
+	hide(): void {
+		if (this.root) {
+			this.root.style.visibility = "hidden";
+		}
+		this.stopPolling();
+		this.clearWatchdog();
+		this.detachStatus();
+		// Report final login state (async; failures read as "not logged in").
+		void this.session
+			.checkLogin()
+			.then((logged) => this.onResult(logged))
+			.catch(() => this.onResult(false));
+	}
 
-		// Visible load status so a failure is diagnosable WITHOUT DevTools.
-		const status = contentEl.createDiv();
-		status.style.cssText =
-			"color:var(--text-muted);font-size:12px;padding:0 0 6px 0;";
-		status.setText("正在加载小红书页面…");
-		const setStatus = (text: string) => {
-			status.setText(text);
-			if (this.watchdogTimer != null) {
-				window.clearTimeout(this.watchdogTimer);
-				this.watchdogTimer = null;
+	/** Remove the overlay from the DOM. Plugin-unload only. */
+	dispose(): void {
+		this.stopPolling();
+		this.clearWatchdog();
+		this.detachStatus();
+		this.root?.remove();
+		this.root = null;
+		this.statusEl = null;
+	}
+
+	private build(): void {
+		const root = document.body.createDiv();
+		root.style.cssText =
+			"position:fixed;left:0;top:0;width:100vw;height:100vh;" +
+			"visibility:hidden;z-index:var(--layer-modal,999);";
+		// Click on the dark backdrop closes the window (same UX as a modal).
+		root.addEventListener("click", (e: MouseEvent) => {
+			if (e.target === root) {
+				this.hide();
 			}
-		};
-		const onFail = (e: Event): void => {
-			const ext = e as Event & { errorCode?: number; detail?: { errorCode?: number } };
-			const code = ext.errorCode ?? ext.detail?.errorCode;
-			setStatus(`⚠ 页面加载失败（code=${code ?? "?"}），请把此行反馈给开发者`);
-		};
+		});
+
+		const card = root.createDiv();
+		card.style.cssText =
+			"position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);" +
+			"width:min(540px,90vw);background:var(--background-primary,var(--background-primary));" +
+			"border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.45);padding:12px;";
+		card.addEventListener("click", (e: MouseEvent) => e.stopPropagation());
+
+		const titlebar = card.createDiv();
+		titlebar.style.cssText =
+			"display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;";
+		const title = titlebar.createEl("span");
+		title.setText("小红书登录");
+		title.style.cssText = "font-weight:600;";
+		const closeBtn = titlebar.createEl("button");
+		closeBtn.setText("关闭");
+		closeBtn.addEventListener("click", () => this.hide());
+
+		this.statusEl = card.createDiv();
+		this.statusEl.style.cssText =
+			"color:var(--text-muted,#888);font-size:12px;padding:0 0 6px 0;";
+		this.statusEl.setText("正在加载小红书页面…");
+
+		const stage = card.createDiv();
+		stage.style.cssText =
+			"width:calc(min(540px,90vw) - 24px);height:min(640px,70vh);position:relative;";
+
+		// The webview container moves into the stage ONCE, here at build time —
+		// never again on open/close. Its parent chain (body > root > card >
+		// stage) lives for the plugin's whole lifetime.
+		const wv = this.session.ensureWebviewElement();
+		const container = wv.parentElement as HTMLElement;
+		stage.appendChild(container);
+		container.style.position = "static";
+		container.style.left = "0";
+		container.style.top = "0";
+		container.style.width = "100%";
+		container.style.height = "100%";
+		wv.style.width = "100%";
+		wv.style.height = "100%";
+
+		this.root = root;
+	}
+
+	private setStatus(text: string): void {
+		this.statusEl?.setText(text);
+		this.clearWatchdog();
+	}
+
+	private clearWatchdog(): void {
+		if (this.watchdogTimer != null) {
+			window.clearTimeout(this.watchdogTimer);
+			this.watchdogTimer = null;
+		}
+	}
+
+	/** Wire the webview load lifecycle into the visible status line. */
+	private attachStatus(): void {
+		this.detachStatus();
+		const wv = this.session.getWebview();
+		if (!wv) {
+			return;
+		}
 		const attach = (name: string, handler: EventListener): void => {
 			wv.addEventListener(name, handler);
 			this.statusHandlers.push([name, handler]);
 		};
-		attach("did-start-loading", () => setStatus("加载中…"));
-		attach("dom-ready", () => setStatus("页面已加载 ✓"));
-		attach("did-stop-loading", () => setStatus("页面已加载 ✓"));
-		attach("did-fail-load", onFail);
-		// Surface guest-page errors (e.g. QR endpoint failures) in the status
-		// line so they are diagnosable without opening DevTools.
+		attach("did-start-loading", () => this.setStatus("加载中…"));
+		attach("dom-ready", () => this.setStatus("页面已加载 ✓"));
+		attach("did-stop-loading", () => this.setStatus("页面已加载 ✓"));
+		attach("did-fail-load", (e: Event): void => {
+			const ext = e as Event & { errorCode?: number; detail?: { errorCode?: number } };
+			const code = ext.errorCode ?? ext.detail?.errorCode;
+			this.setStatus(`⚠ 页面加载失败（code=${code ?? "?"}），请把此行反馈给开发者`);
+		});
+		// Surface guest-page errors (e.g. the QR endpoint failing) so they are
+		// diagnosable without DevTools.
 		attach("console-message", (e: Event): void => {
 			const ext = e as Event & {
 				level?: number;
@@ -82,70 +166,45 @@ export class RedNoteLoginModal extends Modal {
 			const level = ext.level ?? ext.detail?.level;
 			const msg = ext.message ?? ext.detail?.message ?? "";
 			if (level === 3 || /error|failed|ERR_/i.test(msg)) {
-				setStatus(`⚠ 页面报错：${msg.slice(0, 120)}`);
+				this.setStatus(`⚠ 页面报错：${msg.slice(0, 120)}`);
 			}
 		});
 		this.watchdogTimer = window.setTimeout(() => {
-			status.setText("⚠ 10 秒内页面仍未加载，webview 可能未启动，请把此行反馈给开发者");
+			this.setStatus("⚠ 10 秒内页面仍未加载，webview 可能未启动，请把此行反馈给开发者");
 		}, 10000);
-
-		// Explicit modal size: the webview itself has fixed px size (480x640,
-		// see ensureWebviewElement); give contentEl a definite height too, so
-		// the container's percentage sizes resolve instead of collapsing to 0.
-		// Adaptive modal size: big enough for the XHS login page, but capped by
-		// the Obsidian window so the QR area is never cropped in small windows.
-		contentEl.style.width = "min(540px, 90vw)";
-		contentEl.style.height = "min(720px, 80vh)";
-		contentEl.style.minWidth = "min(540px, 90vw)";
-		contentEl.style.minHeight = "min(720px, 80vh)";
-
-		// Move the webview into the modal so the user can interact with it,
-		// and CLEAR the offscreen parking styles from the move-in path.
-		if (container) {
-			contentEl.appendChild(container);
-			container.style.display = "block";
-			container.style.position = "static";
-			container.style.left = "0";
-			container.style.top = "0";
-			container.style.width = "100%";
-			container.style.height = "100%";
-		}
-
-		// Kick off the page load (no-op if already loading/loaded). Not awaited:
-		// the user watches the page load live and the poll loop below detects
-		// the login regardless.
-		void this.session.ensureWebview();
-
-		// Poll for login success while the modal is open.
-		this.startPolling();
 	}
 
-	private async startPolling(): Promise<void> {
-		// Stop any previous poller.
+	private detachStatus(): void {
+		const wv = this.session.getWebview();
+		if (wv) {
+			for (const [name, handler] of this.statusHandlers) {
+				wv.removeEventListener(name, handler);
+			}
+		}
+		this.statusHandlers = [];
+	}
+
+	/** Poll for login success while the window is visible. */
+	private startPolling(): void {
 		this.stopPolling();
 		const check = async (): Promise<void> => {
-			if (this.finished) return;
+			if (this.finished || !this.root || this.root.style.visibility === "hidden") {
+				return;
+			}
 			try {
 				const ok = await this.session.checkLogin();
 				if (ok) {
 					this.finished = true;
 					this.stopPolling();
 					new Notice("小红书登录成功");
-					// Give the user a brief moment to see the confirmation,
-					// then close and restore the webview to its hidden slot.
-					window.setTimeout(() => {
-						this.onResult(true);
-						this.close();
-					}, 800);
+					// Brief confirmation, then close (visibility only — no DOM change).
+					window.setTimeout(() => this.hide(), 800);
 					return;
 				}
 			} catch {
-				// A signing/network hiccup while polling should not stop the
-				// poller; keep trying.
+				// A signing/network hiccup while polling must not stop the poller.
 			}
-			if (!this.finished) {
-				this.pollTimer = window.setTimeout(check, 2000);
-			}
+			this.pollTimer = window.setTimeout(check, 2000);
 		};
 		this.pollTimer = window.setTimeout(check, 2000);
 	}
@@ -155,51 +214,5 @@ export class RedNoteLoginModal extends Modal {
 			window.clearTimeout(this.pollTimer);
 			this.pollTimer = null;
 		}
-	}
-
-	onClose(): void {
-		this.finished = true;
-		this.stopPolling();
-		if (this.watchdogTimer != null) {
-			window.clearTimeout(this.watchdogTimer);
-			this.watchdogTimer = null;
-		}
-		const wvForStatus = this.session.getWebview();
-		if (wvForStatus) {
-			for (const [name, handler] of this.statusHandlers) {
-				wvForStatus.removeEventListener(name, handler);
-			}
-		}
-		this.statusHandlers = [];
-
-		// Restore the webview: RE-parent its container back to document.body
-		// FIRST, then park it offscreen there. Obsidian may detach the modal
-		// DOM after onClose; a webview left inside the modal would be
-		// destroyed with it, dropping the session (violating RedNoteSession's
-		// "never removed from the DOM" contract). appendChild to body is safe
-		// in both cases — whether or not the framework later detaches the
-		// modal subtree, the container now lives directly under body. It is
-		// also idempotent (re-appending an already-parked container is a
-		// no-op move within body). Keep it RENDERED offscreen (position:fixed)
-		// — never display:none, which zeroes the Electron guest view layout
-		// and caused the login white screen.
-		const wv = this.session.getWebview();
-		const container = wv?.parentElement;
-		if (container) {
-			document.body.appendChild(container);
-			container.style.display = "block";
-			container.style.position = "fixed";
-			container.style.left = "-99999px";
-			container.style.top = "0";
-			container.style.width = "1200px";
-			container.style.height = "800px";
-		}
-
-		// Report final state (login may already have been confirmed).
-		void this.session.checkLogin().then((logged) => {
-			this.onResult(logged);
-		}).catch(() => {
-			this.onResult(false);
-		});
 	}
 }

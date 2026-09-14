@@ -10,7 +10,7 @@ import { App, Notice, Plugin, PluginSettingTab, Setting, ToggleComponent, TextCo
 import { RedNoteSession } from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
-import { RedNoteLoginModal } from "./src/rednote/login";
+import { RedNoteLoginOverlay } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
 import {
 	evaluateRateLimit,
@@ -65,7 +65,7 @@ export default class RedNoteSyncPlugin extends Plugin {
 	private session = new RedNoteSession();
 	private syncing = false;
 	/** Guard against re-entrant login modals fighting over one resident webview. */
-	private loginModalOpen = false;
+	private loginOverlay: RedNoteLoginOverlay | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -94,7 +94,10 @@ export default class RedNoteSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		// Destroy the resident webview (drops the session; next use re-logins).
+		// Remove the login overlay first (it hosts the resident webview), then
+		// destroy the session (drops the login; next use re-logins).
+		this.loginOverlay?.dispose();
+		this.loginOverlay = null;
 		this.session.destroy();
 	}
 
@@ -107,23 +110,17 @@ export default class RedNoteSyncPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	/** Open the embedded login modal and keep the webview resident. */
+	/** Open the embedded login window and keep the webview resident. */
 	openLogin(): void {
-		// Re-entrancy guard: a second modal would move the same resident webview
-		// container while the first is showing it, corrupting the session.
-		if (this.loginModalOpen) {
-			new Notice("登录窗口已打开，请先关闭再重新打开");
-			return;
+		// The overlay is a PERSISTENT div in document.body (never a Modal, never
+		// reparented — see RedNoteLoginOverlay rationale). Re-show the same
+		// instance; the webview/session survive every open/close cycle.
+		if (!this.loginOverlay) {
+			this.loginOverlay = new RedNoteLoginOverlay(this.session, (logged: boolean) => {
+				void this.updateLoginState(logged);
+			});
 		}
-		this.loginModalOpen = true;
-		const modal = new RedNoteLoginModal(this.app, this.session, (logged: boolean) => {
-			// This callback is invoked from the modal's onClose() (either the
-			// success-confirm path or a manual close), so it is the reliable
-			// place to release the re-entrancy guard.
-			this.loginModalOpen = false;
-			void this.updateLoginState(logged);
-		});
-		modal.open();
+		this.loginOverlay.show();
 	}
 
 	/**

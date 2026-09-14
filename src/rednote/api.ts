@@ -28,13 +28,12 @@ import { mergeNoteCard } from "./extract";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
-/**
- * Stable Chrome UA. The default Electron UA contains "Electron", which XHS is
- * known to fingerprint and reject. Mirrors MediaCrawler core.py user_agent.
- */
-const CHROME_UA =
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-	"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+// NOTE: no useragent override on purpose. Per community analysis of
+// obsidian.asar 1.13.7, Obsidian installs a session.webRequest hook per
+// partition that rewrites the User-Agent header AFTER the webview attribute
+// would apply, so the attribute is unreliable here anyway (see
+// webview-ua-override plugin write-up). Surfing (reference implementation)
+// sets no useragent either. Fewer moving parts, one less crash variable.
 
 const HOST = "https://edith.xiaohongshu.com";
 const INDEX_URL = "https://www.xiaohongshu.com";
@@ -49,8 +48,6 @@ const ALLOWED_HOSTS = [
 
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
-	/** Navigate the webview to a URL (the way to pull a hijacked frame back). */
-	loadURL?: (url: string) => void;
 	executeJavaScript?: (code: string) => Promise<unknown>;
 };
 
@@ -138,7 +135,6 @@ export class RedNoteSession {
 		// partition MUST be set before attach/src: it selects the persistent
 		// session the login cookies will live in.
 		el.setAttribute("partition", WEBVIEW_PARTITION);
-		el.setAttribute("useragent", CHROME_UA);
 		// NOTE: allowpopups is intentionally NOT set. Electron treats boolean
 		// webview attributes by PRESENCE (any value, including "false", means
 		// enabled), so setAttribute("allowpopups", "false") would have been
@@ -236,10 +232,10 @@ export class RedNoteSession {
 		//     (If a build does emit a cancellable will-navigate we still listen
 		//     for it and preventDefault as a bonus — it never fires on the
 		//     standard element, so it is harmless.)
-		// Pull the frame back home ONLY on a deferred, rate-limited schedule:
-		// calling loadURL() synchronously inside a navigation event callback can
-		// trip Chromium CHECK assertions in the host process (observed as an
-		// 0x80000003 APPCRASH of Obsidian.exe right after the login page loaded).
+		// Pull the frame back home ONLY on a deferred, rate-limited schedule,
+		// and ONLY via setAttribute("src") — never loadURL(), which Surfing (the
+		// community reference) avoids entirely, and never synchronously inside
+		// a navigation event callback (Chromium CHECK / host 0x80000003 crash).
 		let lastBackHome = 0;
 		const forceBackHome = () => {
 			const now = Date.now();
@@ -248,11 +244,7 @@ export class RedNoteSession {
 			}
 			lastBackHome = now;
 			window.setTimeout(() => {
-				if (typeof el.loadURL === "function") {
-					el.loadURL(INDEX_URL);
-				} else {
-					el.setAttribute("src", INDEX_URL);
-				}
+				el.setAttribute("src", INDEX_URL);
 			}, 250);
 		};
 		const watchNavigation = (name: string, cancellable: boolean) => {
@@ -273,6 +265,17 @@ export class RedNoteSession {
 		watchNavigation("will-navigate", true);
 		watchNavigation("did-navigate", false);
 		watchNavigation("did-navigate-in-page", false);
+
+		// Surfing pattern: if the webview is ever destroyed out from under us
+		// (e.g. its node got moved to another document by Obsidian workspace
+		// machinery), invalidate our references so the next ensure* call
+		// recreates it from scratch. We NEVER move a live webview ourselves.
+		el.addEventListener("destroyed", () => {
+			console.log("[pull-rednote] webview destroyed - will recreate on next use");
+			this.container = null;
+			this.webview = null;
+			this.readyPromise = null;
+		});
 
 		this.readyPromise = new Promise<void>((resolve) => {
 			el.addEventListener("did-finish-load", () => resolve(), { once: true });
