@@ -103,3 +103,11 @@
 - 修复（缓解性，a79ba14）：①门禁回跳改 250ms 延迟 + 1.5s 限频（消除重入）②移除 `allowpopups="false"` 属性——Electron 布尔属性"存在即开启"，原写法语义反转（缺省=禁弹窗，正确）③webview/弹窗尺寸改自适应 `min(480px,85vw)/min(640px,70vh)` 等，小窗口不再裁掉二维码区④状态行透出 guest 页面 console 报错（诊断二维码不渲染）
 - 诚实声明：崩溃根因未 100% 确证（无受控复现）；若修复后仍崩，下一步依次排除：移除整个 did-navigate 门禁 → 移除登录轮询的 executeJavaScript → 移除 useragent 覆盖
 - 证据：build exit 0（main.js 47.2kb）、72/72 测试通过、已部署 vault（01:54）
+
+## ADR-012 登录窗口改为常驻浮层（2026-09-15，基于社区证据包）
+
+- 研究证据（public-source-researcher，13 来源）：Electron 修复记录 #38996（close 回调里移除 webview 致崩）/ #38603（close+reparent UAF）与本项目 3 次恒定偏移 0x80000003 APPCRASH 同构——崩溃源即 a58bf2a 引入的 onClose reparent；Surfing（PKM-er/Obsidian-Surfing，社区参考实现）从不把 webview 放 Modal、从不迁移存活节点、导航只用 setAttribute("src") 从不用 loadURL；Obsidian 1.13.7 会按 partition 装 webRequest 钩子改写 UA（useragent 属性不可靠，社区为此有 webview-ua-override 插件）
+- 变更：`RedNoteLoginModal`（Obsidian Modal）→ `RedNoteLoginOverlay`（document.body 常驻 div；开/关仅切 visibility；隐藏用 visibility:hidden 保布局）；webview 构建时一次性挂入、此后零节点迁移；仅插件卸载时 dispose；main.ts 卸载顺序 overlay → session
+- api.ts：移除 useragent 属性与 CHROME_UA 常量；forceBackHome 仅 setAttribute("src")（保留 250ms 延迟 + 1.5s 限频）；新增 `destroyed` 监听 → 引用失效、下次惰性重建（Surfing 模式）
+- 二维码 `Failed to fetch` 判定为网络层问题：系统代理 127.0.0.1:7890（Clash）确认开启，webview 会话走系统代理，小红书接口经境外节点被断；用户侧动作：Clash 为 `*.xiaohongshu.com`、`*.xhscdn.com` 配置直连（或临时关代理验证）
+- 证据：build exit 0（main.js 47.9kb）、72/72 测试通过、已部署 vault
