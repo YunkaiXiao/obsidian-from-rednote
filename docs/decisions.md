@@ -45,3 +45,9 @@
 - AI 字段：`ai_model` + `ai_sections` 列表（transcript / image_analysis），比单一布尔表达力强
 - 字段命名：参考产品的 `resourceId` 更名为 `note_id`
 - 完整模板见 `docs/note-template.md`
+
+## ADR-007 登录实现与 License（2026-09-14，用户确认）
+
+- 登录：v1 采用**插件内嵌登录页**（隐藏 webview 加载小红书，用户扫码/输密码，会话由 webview 保持），不做粘贴 cookie 注入（httpOnly 注入实现更绕且体验差）；这同时就是参考产品的扫码登录形态
+- 取数：API 请求在 webview 内执行，签名（X-s/X-t）由小红书自身前端 JS 自动完成，规避算法更换导致的失效
+- License：**MIT**，Copyright (c) 2026 YunkaiXiao
