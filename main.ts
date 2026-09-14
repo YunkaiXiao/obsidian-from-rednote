@@ -10,7 +10,7 @@ import { App, Notice, Plugin, PluginSettingTab, Setting, ToggleComponent, TextCo
 import { RedNoteSession } from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
-import { RedNoteLoginOverlay } from "./src/rednote/login";
+import { RedNoteLoginView, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
 import {
 	evaluateRateLimit,
@@ -65,7 +65,6 @@ export default class RedNoteSyncPlugin extends Plugin {
 	private session = new RedNoteSession();
 	private syncing = false;
 	/** Guard against re-entrant login modals fighting over one resident webview. */
-	private loginOverlay: RedNoteLoginOverlay | null = null;
 	/** Live settings tab reference so login-state changes can re-render it. */
 	private settingTab: RedNoteSyncSettingTab | null = null;
 
@@ -97,10 +96,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		// Remove the login overlay first (it hosts the resident webview), then
-		// destroy the session (drops the login; next use re-logins).
-		this.loginOverlay?.dispose();
-		this.loginOverlay = null;
+		// The login leaf (if open) is owned and disposed by the workspace.
+		// Tear down the resident/parked webview session last.
 		this.session.destroy();
 	}
 
@@ -113,17 +110,24 @@ export default class RedNoteSyncPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	/** Open the embedded login window and keep the webview resident. */
+	/** Open the login page in a workspace leaf (tab) and keep the session. */
 	openLogin(): void {
-		// The overlay is a PERSISTENT div in document.body (never a Modal, never
-		// reparented — see RedNoteLoginOverlay rationale). Re-show the same
-		// instance; the webview/session survive every open/close cycle.
-		if (!this.loginOverlay) {
-			this.loginOverlay = new RedNoteLoginOverlay(this.session, (logged: boolean) => {
-				void this.updateLoginState(logged);
-			});
+		// ADR-013: the login page lives in an ItemView — Obsidian owns its whole
+		// lifecycle (we write no close/destroy code). The tab can be popped out
+		// into its own window and resized freely. Closing it destroys the
+		// webview element, which is fine: the login session persists in the
+		// partition and is lazily recreated for signed sync requests.
+		const existing = this.app.workspace.getLeavesOfType(LOGIN_LEAF_VIEW_TYPE);
+		const leaf = existing.length > 0 ? existing[0] : this.app.workspace.getLeaf(true);
+		if (existing.length > 0) {
+			this.app.workspace.setActiveLeaf(leaf);
+			return;
 		}
-		this.loginOverlay.show();
+		const view = new RedNoteLoginView(leaf, this.session, () => {
+			void this.updateLoginState(true);
+		});
+		leaf.open(view);
+		this.app.workspace.setActiveLeaf(leaf);
 	}
 
 	/**
@@ -142,9 +146,9 @@ export default class RedNoteSyncPlugin extends Plugin {
 			this.settings.loginStatus = false;
 		}
 		await this.saveSettings();
-		// Re-render the settings tab so the login status the user is looking at
-		// reflects the new state immediately (not only on next open).
-		this.settingTab?.display();
+		// Re-render the settings tab (deferred out of whatever callback stack
+		// we are in) so the visible login state updates immediately.
+		window.setTimeout(() => this.settingTab?.display(), 0);
 	}
 
 	/** The core sync command (M2). */
