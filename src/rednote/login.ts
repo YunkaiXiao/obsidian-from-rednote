@@ -21,11 +21,15 @@ export class RedNoteLoginOverlay {
 	private session: RedNoteSession;
 	private onResult: (logged: boolean) => void;
 	private root: HTMLElement | null = null;
+	private stageEl: HTMLElement | null = null;
 	private statusEl: HTMLElement | null = null;
 	private statusHandlers: Array<[string, EventListener]> = [];
 	private watchdogTimer: number | null = null;
 	private pollTimer: number | null = null;
 	private finished = false;
+	/** Stage size in integer pixels (JS-computed; no CSS min()/vw/vh so nothing
+	 * depends on CSS math resolution inside the webview chain). */
+	private stageSize = { w: 480, h: 640 };
 
 	constructor(session: RedNoteSession, onResult: (logged: boolean) => void) {
 		this.session = session;
@@ -38,7 +42,13 @@ export class RedNoteLoginOverlay {
 			this.build();
 		}
 		this.finished = false;
+		this.applySize();
 		(this.root as HTMLElement).style.visibility = "visible";
+		// The page may have loaded while the overlay was hidden; Chromium skips
+		// compositing for invisible subtrees, so the guest viewport can be stuck
+		// at a stale tiny size (page rendered as a thin scrollable strip).
+		// Force a guest viewport re-sync every time we become visible.
+		this.kickGuestResize();
 		this.attachStatus();
 		this.startPolling();
 		// Kick off / await the page load (no-op when already loaded).
@@ -104,8 +114,8 @@ export class RedNoteLoginOverlay {
 		this.statusEl.setText("正在加载小红书页面…");
 
 		const stage = card.createDiv();
-		stage.style.cssText =
-			"width:calc(min(540px,90vw) - 24px);height:min(640px,70vh);position:relative;";
+		stage.style.position = "relative";
+		this.stageEl = stage;
 
 		// The webview container moves into the stage ONCE, here at build time —
 		// never again on open/close. Its parent chain (body > root > card >
@@ -118,13 +128,44 @@ export class RedNoteLoginOverlay {
 		container.style.top = "0";
 		container.style.width = "100%";
 		container.style.height = "100%";
-		// DO NOT resize the webview itself to 100%/percentages: Electron
-		// webviews collapse to (near) zero height with percent-only sizing
-		// (documented in api.ts). The webview keeps its own explicit adaptive
-		// size (min(480px,85vw) x min(640px,70vh)) assigned at creation; the
-		// stage is sized to match, and the card auto-heights around them.
+		// Sizing is applied by applySize()/kickGuestResize() in integer px.
+		// Electron webviews collapse with percent-only sizing, and CSS min()
+		// here adds nothing but resolution variables — see kickGuestResize for
+		// the guest-viewport sync problem.
 
 		this.root = root;
+	}
+
+	/** Compute the stage size from the current window and apply it in px. */
+	private applySize(): void {
+		this.stageSize = {
+			w: Math.min(480, Math.max(280, Math.floor(window.innerWidth * 0.85))),
+			h: Math.min(640, Math.max(360, Math.floor(window.innerHeight * 0.7))),
+		};
+		if (this.stageEl) {
+			this.stageEl.style.width = `${this.stageSize.w}px`;
+			this.stageEl.style.height = `${this.stageSize.h}px`;
+		}
+	}
+
+	/**
+	 * Force the Electron guest to re-sync its viewport to the element size.
+	 * A page loaded while the overlay was visibility:hidden gets a stale tiny
+	 * guest viewport (rendered as a thin scrollable strip); toggling the
+	 * element height by a few px makes Chromium push a real resize to the
+	 * guest process. Called on every show() and after dom-ready.
+	 */
+	private kickGuestResize(): void {
+		const wv = this.session.getWebview();
+		if (!wv) {
+			return;
+		}
+		const { w, h } = this.stageSize;
+		wv.style.width = `${w}px`;
+		wv.style.height = `${Math.max(0, h - 4)}px`;
+		window.setTimeout(() => {
+			wv.style.height = `${h}px`;
+		}, 60);
 	}
 
 	private setStatus(text: string): void {
@@ -151,7 +192,11 @@ export class RedNoteLoginOverlay {
 			this.statusHandlers.push([name, handler]);
 		};
 		attach("did-start-loading", () => this.setStatus("加载中…"));
-		attach("dom-ready", () => this.setStatus("页面已加载 ✓"));
+		attach("dom-ready", () => {
+			this.setStatus("页面已加载 ✓");
+			// Guest just (re)attached — its viewport may be stale. Re-sync.
+			this.kickGuestResize();
+		});
 		attach("did-stop-loading", () => this.setStatus("页面已加载 ✓"));
 		attach("did-fail-load", (e: Event): void => {
 			const ext = e as Event & { errorCode?: number; detail?: { errorCode?: number } };
