@@ -111,3 +111,11 @@
 - api.ts：移除 useragent 属性与 CHROME_UA 常量；forceBackHome 仅 setAttribute("src")（保留 250ms 延迟 + 1.5s 限频）；新增 `destroyed` 监听 → 引用失效、下次惰性重建（Surfing 模式）
 - 二维码 `Failed to fetch` 判定为网络层问题：系统代理 127.0.0.1:7890（Clash）确认开启，webview 会话走系统代理，小红书接口经境外节点被断；用户侧动作：Clash 为 `*.xiaohongshu.com`、`*.xhscdn.com` 配置直连（或临时关代理验证）
 - 证据：build exit 0（main.js 47.9kb）、72/72 测试通过、已部署 vault
+
+## ADR-013 登录页迁入 workspace leaf（2026-09-15，第三次架构修正）
+
+- 第十轮结果：自绘浮层（visibility 切换方案）在点击关闭时再次崩掉 Obsidian——这次**无 WER 主进程记录**（与前三代 0x80000003 不同），疑为渲染进程死亡；结论：自管理容器的每种关闭/隐藏手段（reparent、visibility、display 踢、关闭回调刷新设置页）都在踩 Electron webview 生命周期雷，防不胜防
+- 决策：**放弃一切自绘容器**，登录页改为 workspace 标签页（ItemView）——即 Surfing 参考实现的宿主模式：Obsidian 全权管理生命周期，插件零关闭代码；标签页占满编辑区、可弹出独立窗口任意拉大（满足用户"用整个窗口"诉求）
+- 关闭标签页销毁 webview 是设计内行为：登录态存于 persist 分区磁盘；session 的 `destroyed` 监听将引用置空，同步时惰性重建 webview（免登录）
+- 保留：登录检测（无签名 selfinfo 优先 + lastCheckInfo 透出状态行）、设置页即时刷新（deferred setTimeout）、resize kick + 元素自检
+- 流程事故记录：089bae2 提交时 tsc 类型错误被 `| tail` 管道吞掉退出码导致旧产物入库；已改为显式退出码检查（BUILD_EXIT=0 才继续），079c3ea 为首个有效构建
