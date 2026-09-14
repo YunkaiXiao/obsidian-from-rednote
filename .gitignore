@@ -1,0 +1,20 @@
+# Node / 构建产物
+node_modules/
+dist/
+build/
+*.log
+
+# Obsidian 插件构建产物（发版时再打包）
+main.js
+*.js.map
+
+# 敏感信息：cookie、令牌绝不入库
+.env
+.env.*
+cookies*.json
+*token*.json
+secrets/
+
+# 系统文件
+.DS_Store
+Thumbs.db
