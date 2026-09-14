@@ -18,6 +18,9 @@ export class RedNoteLoginModal extends Modal {
 	private onResult: (logged: boolean) => void;
 	private pollTimer: number | null = null;
 	private finished = false;
+	/** Load-status wiring (visible line in the modal + cleanup on close). */
+	private statusHandlers: Array<[string, EventListener]> = [];
+	private watchdogTimer: number | null = null;
 
 	/**
 	 * @param app       Obsidian app.
@@ -42,6 +45,35 @@ export class RedNoteLoginModal extends Modal {
 		// left the freshly opened modal completely blank in the meantime.
 		const wv = this.session.ensureWebviewElement();
 		const container = wv.parentElement;
+
+		// Visible load status so a failure is diagnosable WITHOUT DevTools.
+		const status = contentEl.createDiv();
+		status.style.cssText =
+			"color:var(--text-muted);font-size:12px;padding:0 0 6px 0;";
+		status.setText("正在加载小红书页面…");
+		const setStatus = (text: string) => {
+			status.setText(text);
+			if (this.watchdogTimer != null) {
+				window.clearTimeout(this.watchdogTimer);
+				this.watchdogTimer = null;
+			}
+		};
+		const onFail = (e: Event): void => {
+			const ext = e as Event & { errorCode?: number; detail?: { errorCode?: number } };
+			const code = ext.errorCode ?? ext.detail?.errorCode;
+			setStatus(`⚠ 页面加载失败（code=${code ?? "?"}），请把此行反馈给开发者`);
+		};
+		const attach = (name: string, handler: EventListener): void => {
+			wv.addEventListener(name, handler);
+			this.statusHandlers.push([name, handler]);
+		};
+		attach("did-start-loading", () => setStatus("加载中…"));
+		attach("dom-ready", () => setStatus("页面已加载 ✓"));
+		attach("did-stop-loading", () => setStatus("页面已加载 ✓"));
+		attach("did-fail-load", onFail);
+		this.watchdogTimer = window.setTimeout(() => {
+			status.setText("⚠ 10 秒内页面仍未加载，webview 可能未启动，请把此行反馈给开发者");
+		}, 10000);
 
 		// Explicit modal size: the webview itself has fixed px size (480x640,
 		// see ensureWebviewElement); give contentEl a definite height too, so
@@ -112,6 +144,17 @@ export class RedNoteLoginModal extends Modal {
 	onClose(): void {
 		this.finished = true;
 		this.stopPolling();
+		if (this.watchdogTimer != null) {
+			window.clearTimeout(this.watchdogTimer);
+			this.watchdogTimer = null;
+		}
+		const wvForStatus = this.session.getWebview();
+		if (wvForStatus) {
+			for (const [name, handler] of this.statusHandlers) {
+				wvForStatus.removeEventListener(name, handler);
+			}
+		}
+		this.statusHandlers = [];
 
 		// Restore the webview: RE-parent its container back to document.body
 		// FIRST, then park it offscreen there. Obsidian may detach the modal

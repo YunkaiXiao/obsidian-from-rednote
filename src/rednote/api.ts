@@ -49,10 +49,6 @@ const ALLOWED_HOSTS = [
 
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
-	partition?: string;
-	userAgent?: string;
-	allowpopups?: boolean;
-	src?: string;
 	/** Navigate the webview to a URL (the way to pull a hijacked frame back). */
 	loadURL?: (url: string) => void;
 	executeJavaScript?: (code: string) => Promise<unknown>;
@@ -134,13 +130,16 @@ export class RedNoteSession {
 			return this.webview;
 		}
 		const el = document.createElement("webview") as WebviewEl;
-		// CRITICAL: partition MUST be set before the webview is attached / has a
-		// src — it selects the session to load into, and once the element starts
-		// loading with the default (isolated) session the login won't persist.
-		// (Order verified: partition/UA/size -> appendChild -> src below.)
-		el.partition = WEBVIEW_PARTITION;
-		el.userAgent = CHROME_UA;
-		el.allowpopups = false;
+		// CRITICAL (white-screen root cause): Electron's <webview> is ATTRIBUTE-
+		// driven (attributeChangedCallback). Plain property assignment
+		// (el.src = …, el.partition = …) is NOT reflected to attributes in this
+		// Electron build, so the navigation never started and the webview stayed
+		// on about:blank — the all-white login modal. Always use setAttribute.
+		// partition MUST be set before attach/src: it selects the persistent
+		// session the login cookies will live in.
+		el.setAttribute("partition", WEBVIEW_PARTITION);
+		el.setAttribute("useragent", CHROME_UA);
+		el.setAttribute("allowpopups", "false");
 		// CRITICAL: the webview element has NO reliable default size — with only
 		// percent/100% sizing it collapses to 0 (or 300x300) when reparented into
 		// a modal content box that has no fixed height of its own, which is what
@@ -176,6 +175,9 @@ export class RedNoteSession {
 		});
 		el.addEventListener("did-stop-loading", () => {
 			console.log("[pull-rednote] webview did-stop-loading");
+		});
+		el.addEventListener("dom-ready", () => {
+			console.log("[pull-rednote] webview dom-ready");
 		});
 		el.addEventListener("did-fail-load", (e: Event) => {
 			// Electron exposes these fields directly on the event; some builds
@@ -237,7 +239,7 @@ export class RedNoteSession {
 			if (typeof el.loadURL === "function") {
 				el.loadURL(INDEX_URL);
 			} else {
-				el.src = INDEX_URL;
+				el.setAttribute("src", INDEX_URL);
 			}
 		};
 		const watchNavigation = (name: string, cancellable: boolean) => {
@@ -277,7 +279,9 @@ export class RedNoteSession {
 			window.setTimeout(() => resolve(), 30000);
 		});
 
-		el.src = INDEX_URL;
+		// Attribute form (NOT el.src = …): property assignment is not reflected
+		// to the webview's attributes and never triggers the navigation.
+		el.setAttribute("src", INDEX_URL);
 		return el;
 	}
 
