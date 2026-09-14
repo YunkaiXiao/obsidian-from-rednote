@@ -119,3 +119,12 @@
 - 关闭标签页销毁 webview 是设计内行为：登录态存于 persist 分区磁盘；session 的 `destroyed` 监听将引用置空，同步时惰性重建 webview（免登录）
 - 保留：登录检测（无签名 selfinfo 优先 + lastCheckInfo 透出状态行）、设置页即时刷新（deferred setTimeout）、resize kick + 元素自检
 - 流程事故记录：089bae2 提交时 tsc 类型错误被 `| tail` 管道吞掉退出码导致旧产物入库；已改为显式退出码检查（BUILD_EXIT=0 才继续），079c3ea 为首个有效构建
+
+## ADR-014 本地签名算法移植 + 登录页高度修复（2026-09-15，2d61580）
+
+- 背景：真机证实 2026 年小红书页面 window 上不存在签名函数（getSign 页面探测恒空）→ 同步与签名版 selfinfo 全挂；`wl is not defined` 报错系页面自身噪音（状态行转播所致，非插件 bug）
+- 决策：移植 **xhshow**（MediaCrawler 现行生产签名库，MIT）的纯本地算法为 `src/rednote/sign.ts`：X-S/X-T/x-s-common 从 a1+b1+uri+data 本地计算；黄金向量与 xhshow Python 源码输出**逐字节一致**（GET/POST/b1/x-s-common），新增 12 单测（共 84/84）
+- **b1 结论**：b1 不在 cookie 而在页面 `localStorage.getItem("b1")`；读取失败时本地合成（指纹 JSON → RC4(key=xhswebmplfbt) → 百分号编码重组 → 自定义 base64）
+- getSign 新顺序：eval 读 a1(localStorage b1) → 本地签名 → 页面函数回退 → 双失败 SignError；GET 查询编码改 `quote(safe=',')` 配对签名串
+- 高度根因：CSS 类 `height:100%!important` 压过内联 px；修复=去 !important + applySize 测 contentEl 写三层内联 px + 清除容器离屏内联样式（必要配套，否则页面整体不可见）
+- **已知风险（真机验证焦点）**：xhshow 文档提示 ~2026-03 起部分接口对 XYS_ 格式 X-S 返回 406，需 XYW_（AES-128-CBC）变体——未移植，若同步报 406 再补；localStorage.b1 是否存在未验证
