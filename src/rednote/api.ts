@@ -589,14 +589,24 @@ export class RedNoteSession {
 	 * the avatar/sidebar chrome. Returns {ok, info} for UI surfacing.
 	 */
 	async checkLoginViaPage(): Promise<{ ok: boolean; info: string }> {
+		// Fully defensive: XHS pages can make window.__INITIAL_STATE__ access
+		// throw (guarded getters), and an eval that rejects surfaces as a
+		// GUEST_VIEW_MANAGER_CALL error. Every access is wrapped so the eval
+		// always resolves with a JSON summary.
 		const code = `(() => {
-			const st = (window.__INITIAL_STATE__ || {});
-			const user = st.user || {};
-			const keys = Object.keys(user);
-			const hasUserData = keys.length > 0 && JSON.stringify(user).length > 10;
-			const cookieA1 = /(?:^|; )a1=/.test(document.cookie);
-			const stateKeys = Object.keys(st).slice(0, 12).join(",");
-			return JSON.stringify({ hasUserData, userKeys: keys.slice(0, 6).join(","), cookieA1, stateKeys });
+			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR" };
+			try { out.cookieA1 = /(?:^|; )a1=/.test(document.cookie); } catch (e) {}
+			try {
+				const st = window.__INITIAL_STATE__ || {};
+				out.stateKeys = Object.keys(st).slice(0, 12).join(",");
+				const user = st.user || {};
+				const keys = Object.keys(user);
+				out.userKeys = keys.slice(0, 6).join(",");
+				out.hasUserData = keys.length > 0 && JSON.stringify(user).length > 10;
+			} catch (e) {
+				out.stateKeys = "PROBE_THROW:" + String(e).slice(0, 60);
+			}
+			return JSON.stringify(out);
 		})()`;
 		try {
 			const raw = await this.eval<string>(code);
@@ -626,7 +636,7 @@ export class RedNoteSession {
 		// in" because the signed path died at the (optional) page sign function
 		// before the request was ever sent. selfinfo is cookie-only (pong).
 		this.lastCheckInfo = null;
-		let apiSaysNo = false;
+		let sawAuthyNo = false;
 		for (const unsigned of [true, false]) {
 			try {
 				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
@@ -644,16 +654,21 @@ export class RedNoteSession {
 					return true;
 				}
 				this.lastCheckInfo = "selfinfo 响应不含登录成功标记";
-				apiSaysNo = true;
+				sawAuthyNo = true;
 				break;
 			} catch (e) {
 				if (e instanceof NotLoggedInError) {
-					// Ambiguous in 2026: unsigned selfinfo returns this same
-					// envelope whether logged out OR merely unsigned. Confirm
-					// with the page itself before believing it.
-					apiSaysNo = true;
-					this.lastCheckInfo = e.message;
-					break;
+					sawAuthyNo = true;
+					this.lastCheckInfo = `${e.message}（unsigned=${unsigned}）`;
+					if (!unsigned) {
+						// The SIGNED attempt (locally computed X-S/X-T) also says
+						// no — that is a real logged-out verdict.
+						break;
+					}
+					// An UNSIGNED "no" is ambiguous in 2026 (the same envelope
+					// comes back for "merely unsigned") — fall through and try
+					// the signed attempt before concluding anything.
+					continue;
 				}
 				this.lastCheckInfo = `selfinfo 请求失败（unsigned=${unsigned}）：${
 					e instanceof Error ? e.message : String(e)
@@ -664,7 +679,7 @@ export class RedNoteSession {
 				);
 			}
 		}
-		if (apiSaysNo) {
+		if (sawAuthyNo) {
 			const page = await this.checkLoginViaPage();
 			if (page.ok) {
 				this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;

@@ -27,6 +27,9 @@ export class RedNoteLoginView extends ItemView {
 	private onStateChange: () => void;
 	private statusEl: HTMLElement | null = null;
 	private stageEl: HTMLElement | null = null;
+	/** The webview element actually staged in this leaf (may differ from the
+	 * session's current one after a lazy recreation — see the poller). */
+	private wvEl: HTMLElement | null = null;
 	private statusHandlers: Array<[string, EventListener]> = [];
 	private watchdogTimer: number | null = null;
 	private pollTimer: number | null = null;
@@ -78,6 +81,7 @@ export class RedNoteLoginView extends ItemView {
 		const wv = this.session.ensureWebviewElement();
 		const container = wv.parentElement as HTMLElement;
 		this.stageEl.appendChild(container);
+		this.wvEl = wv;
 		// Clear the offscreen PARKING styles the session set when it created
 		// the container (position:fixed; left:-99999px; 1200x800). Inline
 		// styles beat every class rule, so leaving them in place would keep
@@ -143,8 +147,21 @@ export class RedNoteLoginView extends ItemView {
 	 * inline px to all three layers (stage, container, webview) so no CSS
 	 * rule can shrink the visible page to a thin strip.
 	 */
+	/** The webview element actually inside this leaf's stage (preferred), or
+	 * the session's current one. Sizing the staged element matters: after a
+	 * lazy recreation the session's current webview may be a DIFFERENT
+	 * (parked, invisible) element while the leaf still shows the old one. */
+	private stagedWebview(): (HTMLElement & { setZoomFactor?: (f: number) => void }) | null {
+		const inStage = this.stageEl?.querySelector("webview") as
+			| (HTMLElement & { setZoomFactor?: (f: number) => void })
+			| null;
+		return inStage ?? this.session.getWebview();
+	}
+
+	/** Compute the stage size from the leaf's REAL layout box (contentEl) and
+	 * apply it as inline px to the staged webview's three layers. */
 	private applySize(): void {
-		const wv = this.session.getWebview();
+		const wv = this.stagedWebview();
 		if (!wv || !this.stageEl) {
 			return;
 		}
@@ -177,7 +194,7 @@ export class RedNoteLoginView extends ItemView {
 	 * fits even shorter leaves.
 	 */
 	private kickGuestResize(): void {
-		const wv = this.session.getWebview();
+		const wv = this.stagedWebview();
 		if (!wv) {
 			return;
 		}
@@ -265,6 +282,7 @@ export class RedNoteLoginView extends ItemView {
 			if (this.finished) {
 				return;
 			}
+			this.adoptRecreatedWebview();
 			try {
 				const ok = await this.session.checkLogin();
 				if (ok) {
@@ -276,8 +294,9 @@ export class RedNoteLoginView extends ItemView {
 				}
 				this.pollFailures += 1;
 				if (this.pollFailures % 3 === 1) {
+					const census = this.domCensus();
 					this.setStatus(
-						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}`,
+						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}｜${census}`,
 					);
 				}
 			} catch (e) {
@@ -289,6 +308,43 @@ export class RedNoteLoginView extends ItemView {
 			this.pollTimer = window.setTimeout(check, 2000);
 		};
 		this.pollTimer = window.setTimeout(check, 2000);
+	}
+
+	/** If the session lazily recreated its webview (the staged one died), swap
+	 * the stage over to the live element so the user sees the real page. */
+	private adoptRecreatedWebview(): void {
+		const cur = this.session.getWebview();
+		if (!cur || !this.stageEl || cur === this.wvEl) {
+			return;
+		}
+		const container = cur.parentElement as HTMLElement | null;
+		if (!container) {
+			return;
+		}
+		this.stageEl.empty();
+		this.stageEl.appendChild(container);
+		container.style.position = "static";
+		container.style.left = "auto";
+		container.style.top = "auto";
+		container.style.width = "";
+		container.style.height = "";
+		container.addClass("pull-rednote-login-container");
+		cur.addClass("pull-rednote-login-webview");
+		this.wvEl = cur;
+		this.attachStatus();
+		this.applySize();
+		this.kickGuestResize();
+	}
+
+	/** Host-side webview census for the status line: how many <webview>
+	 * elements exist in the document and how big each renders. */
+	private domCensus(): string {
+		const els = Array.from(document.querySelectorAll("webview"));
+		const rects = els.map((el) => {
+			const r = el.getBoundingClientRect();
+			return `${Math.round(r.width)}×${Math.round(r.height)}`;
+		});
+		return `DOM webview×${els.length}[${rects.join(", ")}]`;
 	}
 
 	private stopPolling(): void {
