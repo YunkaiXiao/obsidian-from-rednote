@@ -64,6 +64,7 @@ export class RedNoteLoginView extends ItemView {
 		this.statusEl.setText("正在加载小红书页面…");
 
 		this.stageEl = contentEl.createDiv();
+		this.stageEl.addClass("pull-rednote-login-stage");
 		this.stageEl.style.cssText = "flex:1 1 auto;position:relative;min-height:200px;";
 
 		// The webview container moves into the leaf ONCE, here. The leaf's DOM
@@ -72,11 +73,8 @@ export class RedNoteLoginView extends ItemView {
 		const wv = this.session.ensureWebviewElement();
 		const container = wv.parentElement as HTMLElement;
 		this.stageEl.appendChild(container);
-		container.style.position = "static";
-		container.style.left = "0";
-		container.style.top = "0";
-		container.style.width = "100%";
-		container.style.height = "100%";
+		container.addClass("pull-rednote-login-container");
+		wv.addClass("pull-rednote-login-webview");
 
 		// Leaf layout settles asynchronously (and re-settles on popout/resize).
 		// A single 50ms probe measured a pre-layout box and left the webview at
@@ -155,18 +153,21 @@ export class RedNoteLoginView extends ItemView {
 		wv.style.display = "none";
 		wv.style.width = `${w}px`;
 		wv.style.height = `${h}px`;
-		window.setTimeout(() => {
-			wv.style.display = "block";
 			window.setTimeout(() => {
-				const rect = wv.getBoundingClientRect();
-				if (rect.height < h - 20) {
-					this.setStatus(
-						`⚠ webview 元素仅 ${Math.round(rect.height)}px（目标 ${h}px），请反馈此行`,
-					);
-				}
-				wv.setZoomFactor?.(0.8);
-			}, 60);
-		}, 30);
+				wv.style.display = "block";
+				window.setTimeout(() => {
+					const rect = wv.getBoundingClientRect();
+					if (rect.height < h - 20) {
+						const stage = this.stageEl?.getBoundingClientRect();
+						this.setStatus(
+							`⚠ 尺寸异常：元素${Math.round(rect.width)}×${Math.round(rect.height)}` +
+								` 舞台${stage ? `${Math.round(stage.width)}×${Math.round(stage.height)}` : "?"}` +
+								` 目标${w}×${h}，请反馈此行`,
+						);
+					}
+					wv.setZoomFactor?.(0.8);
+				}, 60);
+			}, 30);
 	}
 
 	private attachStatus(): void {

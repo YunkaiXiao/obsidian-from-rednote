@@ -518,11 +518,41 @@ export class RedNoteSession {
 	 */
 	lastCheckInfo: string | null = null;
 
+	/**
+	 * Page-side login probe (second opinion): an unsigned selfinfo cannot
+	 * distinguish "not logged in" from "unsigned request rejected" — both
+	 * return {code:-1,success:false}. The PAGE itself knows: XHS SSR pages
+	 * embed login state in window.__INITIAL_STATE__ and logged-in pages carry
+	 * the avatar/sidebar chrome. Returns {ok, info} for UI surfacing.
+	 */
+	async checkLoginViaPage(): Promise<{ ok: boolean; info: string }> {
+		const code = `(() => {
+			const st = (window.__INITIAL_STATE__ || {});
+			const user = st.user || {};
+			const keys = Object.keys(user);
+			const hasUserData = keys.length > 0 && JSON.stringify(user).length > 10;
+			const cookieA1 = /(?:^|; )a1=/.test(document.cookie);
+			return JSON.stringify({ hasUserData, userKeys: keys.slice(0, 6).join(","), cookieA1 });
+		})()`;
+		try {
+			const raw = await this.eval<string>(code);
+			const p = raw ? (JSON.parse(raw) as { hasUserData?: boolean; userKeys?: string; cookieA1?: boolean }) : null;
+			if (!p) {
+				return { ok: false, info: "页面探测无返回" };
+			}
+			const info = `页面侧 INITIAL_STATE.user=${p.userKeys || "无"}，a1=${p.cookieA1 ? "有" : "无"}`;
+			return { ok: Boolean(p.hasUserData), info };
+		} catch (e) {
+			return { ok: false, info: `页面探测失败：${e instanceof Error ? e.message : String(e)}` };
+		}
+	}
+
 	async checkLogin(): Promise<boolean> {
 		// UNSIGNED first: a successful QR login was misreported as "not logged
 		// in" because the signed path died at the (optional) page sign function
 		// before the request was ever sent. selfinfo is cookie-only (pong).
 		this.lastCheckInfo = null;
+		let apiSaysNo = false;
 		for (const unsigned of [true, false]) {
 			try {
 				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
@@ -540,11 +570,16 @@ export class RedNoteSession {
 					return true;
 				}
 				this.lastCheckInfo = "selfinfo 响应不含登录成功标记";
-				return false;
+				apiSaysNo = true;
+				break;
 			} catch (e) {
 				if (e instanceof NotLoggedInError) {
+					// Ambiguous in 2026: unsigned selfinfo returns this same
+					// envelope whether logged out OR merely unsigned. Confirm
+					// with the page itself before believing it.
+					apiSaysNo = true;
 					this.lastCheckInfo = e.message;
-					return false;
+					break;
 				}
 				this.lastCheckInfo = `selfinfo 请求失败（unsigned=${unsigned}）：${
 					e instanceof Error ? e.message : String(e)
@@ -554,6 +589,14 @@ export class RedNoteSession {
 					e instanceof Error ? e.message : e,
 				);
 			}
+		}
+		if (apiSaysNo) {
+			const page = await this.checkLoginViaPage();
+			if (page.ok) {
+				this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;
+				return true;
+			}
+			this.lastCheckInfo = `${this.lastCheckInfo ?? ""}；${page.info}`;
 		}
 		return false;
 	}
