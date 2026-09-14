@@ -25,3 +25,11 @@
 - 接入方式：**OpenAI 兼容接口自定义配置**（base_url + api_key + model 名），不内置厂商预设，兼容 GLM/OpenAI/DeepSeek/Ollama 等；用户自备 key
 - 输出位置：笔记正文末尾追加「## 🤖 AI 摘要」小节（视频转写稿、图片分析），frontmatter 记录 `ai: true` 与模型名；原文与 AI 内容分区
 - AI 功能为可选开关（涉及调用费用），默认关闭
+
+## ADR-005 视频转写形态与格式基线（2026-09-14，用户确认）
+
+- 视频转写：v1 将视频文件直接投喂多模态模型（OpenAI 兼容接口）；超出模型大小/时长限制的跳过并在笔记中标注"转写失败：超限"；ffmpeg 抽音频 + Whisper 转写列为后续可选增强（不引入 v1 依赖）
+- 笔记字段基线：标题、正文、图片、作者、标签、原文链接（对齐参考产品）
+- frontmatter 基线：`resourceId, author, link, tags, category, timestamp` + 扩展 `ai`/`ai_model`
+- 目录基线：`RedNote/Bookmarks/《标题》.md`，图片存 `RedNote/Media/{postId}/`（.webp）
+- 格式改进建议（时间戳拆分、tags 命名空间、collection 字段等）讨论中，采纳项记入 ADR-006
