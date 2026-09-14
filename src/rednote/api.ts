@@ -49,6 +49,7 @@ const ALLOWED_HOSTS = [
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
 	executeJavaScript?: (code: string) => Promise<unknown>;
+	setZoomFactor?: (factor: number) => void;
 };
 
 export function isXhsHost(url: string): boolean {

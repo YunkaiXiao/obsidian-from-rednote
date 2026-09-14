@@ -140,12 +140,17 @@ export class RedNoteLoginOverlay {
 	private applySize(): void {
 		this.stageSize = {
 			w: Math.min(480, Math.max(280, Math.floor(window.innerWidth * 0.85))),
-			h: Math.min(640, Math.max(360, Math.floor(window.innerHeight * 0.7))),
+			h: Math.min(720, Math.max(360, Math.floor(window.innerHeight * 0.85))),
 		};
 		if (this.stageEl) {
 			this.stageEl.style.width = `${this.stageSize.w}px`;
 			this.stageEl.style.height = `${this.stageSize.h}px`;
 		}
+		// The XHS login dialog is a centered, non-scrolling layout: on a short
+		// viewport it clips the QR code's top and cannot be scrolled into view.
+		// Zoom the page out so the same element height shows ~25% more page
+		// (419px viewport ≈ 524 CSS px at 0.8).
+		this.session.getWebview()?.setZoomFactor?.(0.8);
 	}
 
 	/**
