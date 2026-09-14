@@ -92,9 +92,12 @@ export class RedNoteLoginOverlay {
 		});
 
 		const card = root.createDiv();
+		// Near-full-window card: the XHS login layout needs the space, and a
+		// wide viewport also makes XHS serve its proper desktop layout.
 		card.style.cssText =
 			"position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);" +
-			"width:min(540px,90vw);background:var(--background-primary,var(--background-primary));" +
+			"width:calc(100vw - 24px);height:calc(100vh - 24px);" +
+			"background:var(--background-primary,#fff);" +
 			"border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.45);padding:12px;";
 		card.addEventListener("click", (e: MouseEvent) => e.stopPropagation());
 
@@ -136,21 +139,18 @@ export class RedNoteLoginOverlay {
 		this.root = root;
 	}
 
-	/** Compute the stage size from the current window and apply it in px. */
+	/** Compute the stage size from the current window and apply it in px.
+	 * Near-full-window: only the title bar, status line and card padding are
+	 * reserved. */
 	private applySize(): void {
 		this.stageSize = {
-			w: Math.min(480, Math.max(280, Math.floor(window.innerWidth * 0.85))),
-			h: Math.min(720, Math.max(360, Math.floor(window.innerHeight * 0.85))),
+			w: Math.max(320, window.innerWidth - 48),
+			h: Math.max(360, window.innerHeight - 110),
 		};
 		if (this.stageEl) {
 			this.stageEl.style.width = `${this.stageSize.w}px`;
 			this.stageEl.style.height = `${this.stageSize.h}px`;
 		}
-		// The XHS login dialog is a centered, non-scrolling layout: on a short
-		// viewport it clips the QR code's top and cannot be scrolled into view.
-		// Zoom the page out so the same element height shows ~25% more page
-		// (419px viewport ≈ 524 CSS px at 0.8).
-		this.session.getWebview()?.setZoomFactor?.(0.8);
 	}
 
 	/**
@@ -170,6 +170,10 @@ export class RedNoteLoginOverlay {
 		wv.style.height = `${Math.max(0, h - 4)}px`;
 		window.setTimeout(() => {
 			wv.style.height = `${h}px`;
+			// Zoom AFTER the guest attached (setZoomFactor before load is
+			// silently ignored by Electron). 0.8 buys ~25% extra page space for
+			// the centered, non-scrolling XHS login dialog.
+			wv.setZoomFactor?.(0.8);
 		}, 60);
 	}
 
