@@ -258,8 +258,13 @@ export class RedNoteLoginOverlay {
 					window.setTimeout(() => this.hide(), 800);
 					return;
 				}
-			} catch {
-				// A signing/network hiccup while polling must not stop the poller.
+			} catch (e) {
+				// A signing/network hiccup while polling must not stop the
+				// poller — but log it so the failure reason is diagnosable.
+				console.warn(
+					"[pull-rednote] login poll failed:",
+					e instanceof Error ? e.message : e,
+				);
 			}
 			this.pollTimer = window.setTimeout(check, 2000);
 		};

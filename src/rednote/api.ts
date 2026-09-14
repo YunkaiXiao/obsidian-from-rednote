@@ -415,16 +415,24 @@ export class RedNoteSession {
 		method: "GET" | "POST",
 		uri: string,
 		data: Record<string, unknown> | null,
+		opts: { unsigned?: boolean } = {},
 	): Promise<Record<string, unknown>> {
-		const sign = await this.getSign(method, uri, data);
-		const headers = {
+		const headers: Record<string, string> = {
 			accept: "application/json, text/plain, */*",
 			"content-type": "application/json;charset=UTF-8",
-			"X-S": sign["X-S"],
-			"X-T": sign["X-T"],
-			"x-s-common": sign["x-s-common"],
-			"X-B3-Traceid": sign["X-B3-Traceid"],
 		};
+		// Signing requires a page-context function (window._webmsxyw & al.) that
+		// is not guaranteed to exist at any given moment. Callers that do NOT
+		// need signatures (selfinfo responds to cookies alone — MediaCrawler's
+		// pong check) pass { unsigned: true } so a missing sign function cannot
+		// break login detection.
+		if (!opts.unsigned) {
+			const sign = await this.getSign(method, uri, data);
+			headers["X-S"] = sign["X-S"];
+			headers["X-T"] = sign["X-T"];
+			headers["x-s-common"] = sign["x-s-common"];
+			headers["X-B3-Traceid"] = sign["X-B3-Traceid"];
+		}
 
 		// Build the full URL. For GET, the query string must be encoded the same
 		// way the sign was computed (browser behavior, commas not encoded) to
@@ -506,16 +514,25 @@ export class RedNoteSession {
 	 * client.pong / query_self: success when data.result.success is true).
 	 */
 	async checkLogin(): Promise<boolean> {
-		try {
-			const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
-			const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-			return Boolean(result && result.success === true);
-		} catch (e) {
-			if (e instanceof NotLoggedInError) return false;
-			// A sign / network error means we can't confirm login; treat as
-			// "unknown" -> false but let the caller distinguish if needed.
-			return false;
+		// UNSIGNED first: a successful QR login was misreported as "not logged
+		// in" because the signed path died at the (optional) page sign function
+		// before the request was ever sent. selfinfo is cookie-only (pong).
+		for (const unsigned of [true, false]) {
+			try {
+				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
+				const result = (data?.result ?? data) as Record<string, unknown> | undefined;
+				return Boolean(result && result.success === true);
+			} catch (e) {
+				if (e instanceof NotLoggedInError) {
+					return false;
+				}
+				console.warn(
+					`[pull-rednote] checkLogin attempt (unsigned=${unsigned}) failed:`,
+					e instanceof Error ? e.message : e,
+				);
+			}
 		}
+		return false;
 	}
 
 	/**
@@ -523,7 +540,12 @@ export class RedNoteSession {
 	 * Derived from selfinfo.
 	 */
 	async getSelfUserId(): Promise<string> {
-		const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
+		let data: Record<string, unknown>;
+		try {
+			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned: true });
+		} catch {
+			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
+		}
 		const result = (data?.result ?? data) as Record<string, unknown> | undefined;
 		const basic = (result?.basic_info ?? result) as Record<string, user_selfinfo> | undefined;
 		const uid = basic?.user_id ?? (result as Record<string, unknown> | undefined)?.user_id;
