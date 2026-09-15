@@ -107,6 +107,21 @@ export class RedNoteLoginView extends ItemView {
 			}, delay);
 		}
 
+		// Last-resort guest viewport sync: reload the page ONCE after the
+		// layout has settled so the guest attaches at the final element size.
+		// (Neither inline px nor absolute-fill sizing nor display-toggle kicks
+		// could revive a guest stuck at its attach-time viewport in this
+		// Electron build; a fresh load at the right size does.)
+		window.setTimeout(() => {
+			const wv = this.stagedWebview() as
+				| (HTMLElement & { reload?: () => void; setZoomFactor?: (f: number) => void })
+				| null;
+			if (wv?.reload) {
+				this.session.log("登录页：一次性 reload 以同步 guest 视口");
+				wv.reload();
+			}
+		}, 1800);
+
 		this.attachStatus();
 		this.startPolling();
 		void this.session.ensureWebview();

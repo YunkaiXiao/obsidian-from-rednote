@@ -54,6 +54,7 @@ const ALLOWED_HOSTS = [
 type WebviewEl = HTMLElement & {
 	executeJavaScript?: (code: string) => Promise<unknown>;
 	setZoomFactor?: (factor: number) => void;
+	reload?: () => void;
 };
 
 export function isXhsHost(url: string): boolean {
@@ -805,10 +806,21 @@ export class RedNoteSession {
 		} catch {
 			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
 		}
+		// Tolerant extraction across known/possible 2026 envelope shapes; when
+		// nothing matches, log the REAL payload shape so the next round can
+		// adapt precisely (this used to silently return "" and the sync threw
+		// NotLoggedInError 3ms after a successful HTTP 200).
 		const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-		const basic = (result?.basic_info ?? result) as Record<string, user_selfinfo> | undefined;
-		const uid = basic?.user_id ?? (result as Record<string, unknown> | undefined)?.user_id;
-		return typeof uid === "string" ? uid : "";
+		const basic = (result?.basic_info ?? result) as Record<string, unknown> | undefined;
+		const candidates = [basic?.user_id, result?.user_id, data?.user_id];
+		const uid = candidates.find((v) => v != null && String(v).length > 0);
+		if (uid == null) {
+			this.log(
+				`getSelfUserId 未找到 user_id，selfinfo data 形状：${JSON.stringify(data).slice(0, 300)}`,
+			);
+			return "";
+		}
+		return String(uid);
 	}
 
 	/**
