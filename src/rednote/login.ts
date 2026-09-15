@@ -130,6 +130,9 @@ export class RedNoteLoginView extends ItemView {
 	}
 
 	private setStatus(text: string): void {
+		if (this.statusEl?.getText() === text) {
+			return;
+		}
 		this.statusEl?.setText(text);
 		this.clearWatchdog();
 	}
@@ -302,6 +305,9 @@ export class RedNoteLoginView extends ItemView {
 					this.setStatus(
 						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}｜${census}`,
 					);
+					this.session.log(
+						`登录页：${census} 目标${this.stageSize.w}×${this.stageSize.h}`,
+					);
 				}
 			} catch (e) {
 				console.warn(
@@ -314,18 +320,25 @@ export class RedNoteLoginView extends ItemView {
 		this.pollTimer = window.setTimeout(check, 2000);
 	}
 
-	/** If the session lazily recreated its webview (the staged one died), swap
-	 * the stage over to the live element so the user sees the real page. */
+	/** If the stage has NO webview at all (e.g. logout destroyed it), adopt
+	 * the session's current one. NEVER touches a live staged element: the old
+	 * unconditional swap fed a destroy→recreate→swap loop that reloaded the
+	 * page every couple of seconds (QR could never complete a scan). */
 	private adoptRecreatedWebview(): void {
+		if (!this.stageEl) {
+			return;
+		}
+		if (this.stageEl.querySelector("webview")) {
+			return;
+		}
 		const cur = this.session.getWebview();
-		if (!cur || !this.stageEl || cur === this.wvEl) {
+		if (!cur) {
 			return;
 		}
 		const container = cur.parentElement as HTMLElement | null;
 		if (!container) {
 			return;
 		}
-		this.stageEl.empty();
 		this.stageEl.appendChild(container);
 		container.style.position = "static";
 		container.style.left = "auto";

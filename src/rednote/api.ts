@@ -268,11 +268,17 @@ export class RedNoteSession {
 		watchNavigation("did-navigate", false);
 		watchNavigation("did-navigate-in-page", false);
 
-		// Surfing pattern: if the webview is ever destroyed out from under us
-		// (e.g. its node got moved to another document by Obsidian workspace
-		// machinery), invalidate our references so the next ensure* call
-		// recreates it from scratch. We NEVER move a live webview ourselves.
+		// Surfing pattern, CONDITIONAL: if THIS element is destroyed, drop the
+		// session refs so the next ensure* recreates. The guard matters: the
+		// login view may swap in a NEWER element while an older one dies, and
+		// an unconditional clear here used to null out the LIVE element's refs,
+		// causing an endless destroy→recreate→swap loop (the page kept
+		// reloading and the QR could never complete a scan).
 		el.addEventListener("destroyed", () => {
+			if (this.webview !== el) {
+				return;
+			}
+			this.log("webview destroyed - will recreate on next use");
 			console.log("[pull-rednote] webview destroyed - will recreate on next use");
 			this.container = null;
 			this.webview = null;
@@ -631,9 +637,28 @@ export class RedNoteSession {
 		}
 	}
 
+	/**
+	 * Structured login check. Each stage appends a labeled part to
+	 * lastCheckInfo so the status line / debug log shows WHICH stage said
+	 * what (a hung stage is identifiable by its missing label).
+	 */
+	/** Optional debug sink (main.ts wires this to debug.log in the plugin dir). */
+	logger: ((line: string) => void) | null = null;
+
+	log(line: string): void {
+		const ts = new Date().toISOString().slice(11, 23);
+		const text = `[${ts}] ${line}`;
+		if (this.logger) {
+			try {
+				this.logger(text);
+			} catch {
+				/* logging must never break the caller */
+			}
+		}
+		console.log(`[pull-rednote] ${text}`);
+	}
+
 	async checkLogin(): Promise<boolean> {
-		// Structured stage labels so the status line shows WHICH stage said what
-		// (a hung stage is identifiable by its missing label).
 		this.lastCheckInfo = null;
 		const parts: string[] = [];
 		let sawAuthyNo = false;
@@ -676,11 +701,13 @@ export class RedNoteSession {
 			const page = await this.checkLoginViaPage();
 			if (page.ok) {
 				this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;
+				this.log(`checkLogin -> true（${this.lastCheckInfo}）`);
 				return true;
 			}
 			parts.push(`页面=否（${page.info.slice(0, 90)}）`);
 		}
 		this.lastCheckInfo = parts.join("；");
+		this.log(`checkLogin -> false：${this.lastCheckInfo}`);
 		return false;
 	}
 
@@ -691,9 +718,11 @@ export class RedNoteSession {
 	 * the next use starts from a fresh page.
 	 */
 	async logout(): Promise<void> {
+		this.log("logout: 开始（服务端 exit + 本地 cookie 过期 + webview 重建）");
 		try {
 			const code = `fetch("https://edith.xiaohongshu.com/api/sns/web/v1/login/exit", {method:"POST", credentials:"include", headers:{"content-type":"application/json;charset=UTF-8"}}).then(r => String(r.status)).catch(e => String(e).slice(0, 80))`;
 			const res = await this.eval<string>(code);
+			this.log(`logout: 服务端 exit 接口返回 ${res}`);
 			console.log("[pull-rednote] logout exit endpoint:", res);
 		} catch (e) {
 			console.warn("[pull-rednote] logout exit endpoint failed:", e);

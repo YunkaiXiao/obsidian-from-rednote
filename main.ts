@@ -72,6 +72,29 @@ export default class RedNoteSyncPlugin extends Plugin {
 	async onload(): Promise<void> {
 		await this.loadSettings();
 
+		// Debug log -> <pluginDir>/debug.log (auto-rotates past ~300KB), so
+		// diagnosis no longer requires screenshots of the status line.
+		const logPath = `${this.manifest.dir}/debug.log`;
+		const adapter = this.app.vault.adapter;
+		this.session.logger = (line: string): void => {
+			void (async () => {
+				try {
+					if (!(await adapter.exists(logPath))) {
+						await adapter.write(logPath, `${line}\n`);
+						return;
+					}
+					const cur = await adapter.read(logPath);
+					await adapter.write(
+						logPath,
+						cur.length > 300_000 ? `${line}\n` : `${cur}${line}\n`,
+					);
+				} catch {
+					/* best effort only */
+				}
+			})();
+		};
+		this.session.log("插件加载，调试日志已启用");
+
 		this.settingTab = new RedNoteSyncSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
 
