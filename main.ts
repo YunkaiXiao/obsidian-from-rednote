@@ -74,26 +74,33 @@ export default class RedNoteSyncPlugin extends Plugin {
 
 		// Debug log -> <pluginDir>/debug.log (auto-rotates past ~300KB), so
 		// diagnosis no longer requires screenshots of the status line.
-		const logPath = `${this.manifest.dir}/debug.log`;
-		const adapter = this.app.vault.adapter;
-		this.session.logger = (line: string): void => {
-			void (async () => {
-				try {
-					if (!(await adapter.exists(logPath))) {
-						await adapter.write(logPath, `${line}\n`);
-						return;
+		// Written via direct fs: the vault adapter silently failed to persist
+		// writes under .obsidian (file got created empty).
+		const vaultRoot = (
+			this.app.vault.adapter as unknown as { basePath?: string }
+		).basePath;
+		const reqFs = (window as unknown as { require?: (m: string) => unknown }).require;
+		if (vaultRoot && reqFs) {
+			try {
+				const fs = reqFs("fs") as typeof import("fs");
+				const logPath = `${vaultRoot}/${this.manifest.dir}/debug.log`;
+				this.session.logger = (line: string): void => {
+					try {
+						const size = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+						if (size > 300_000) {
+							fs.writeFileSync(logPath, `${line}\n`);
+						} else {
+							fs.appendFileSync(logPath, `${line}\n`);
+						}
+					} catch {
+						/* best effort only */
 					}
-					const cur = await adapter.read(logPath);
-					await adapter.write(
-						logPath,
-						cur.length > 300_000 ? `${line}\n` : `${cur}${line}\n`,
-					);
-				} catch {
-					/* best effort only */
-				}
-			})();
-		};
-		this.session.log("插件加载，调试日志已启用");
+				};
+				this.session.log("插件加载，调试日志已启用（fs 直写）");
+			} catch (e) {
+				console.warn("[pull-rednote] fs logger init failed:", e);
+			}
+		}
 
 		this.settingTab = new RedNoteSyncSettingTab(this.app, this);
 		this.addSettingTab(this.settingTab);
