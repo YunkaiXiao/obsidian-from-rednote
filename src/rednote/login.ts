@@ -68,7 +68,8 @@ export class RedNoteLoginView extends ItemView {
 
 		this.statusEl = contentEl.createDiv();
 		this.statusEl.style.cssText =
-			"color:var(--text-muted,#888);font-size:12px;padding:0 0 6px 0;flex:none;";
+			"color:var(--text-muted,#888);font-size:12px;padding:0 0 6px 0;flex:none;" +
+			"white-space:pre-wrap;word-break:break-all;max-height:72px;overflow:hidden;";
 		this.statusEl.setText("正在加载小红书页面…");
 
 		this.stageEl = contentEl.createDiv();
@@ -282,8 +283,11 @@ export class RedNoteLoginView extends ItemView {
 			if (this.finished) {
 				return;
 			}
-			this.adoptRecreatedWebview();
-			try {
+		this.adoptRecreatedWebview();
+		// Re-measure every cycle: the leaf layout box may only become valid
+		// after popout/activation/tab shuffling that fires no resize event.
+		this.applySize();
+		try {
 				const ok = await this.session.checkLogin();
 				if (ok) {
 					this.finished = true;
@@ -337,14 +341,16 @@ export class RedNoteLoginView extends ItemView {
 	}
 
 	/** Host-side webview census for the status line: how many <webview>
-	 * elements exist in the document and how big each renders. */
+	 * elements exist, how big each renders, and the measured contentEl box
+	 * (so a failing layout measurement is visible at a glance). */
 	private domCensus(): string {
 		const els = Array.from(document.querySelectorAll("webview"));
 		const rects = els.map((el) => {
 			const r = el.getBoundingClientRect();
 			return `${Math.round(r.width)}×${Math.round(r.height)}`;
 		});
-		return `DOM webview×${els.length}[${rects.join(", ")}]`;
+		const box = this.contentEl.getBoundingClientRect();
+		return `DOM webview×${els.length}[${rects.join(", ")}] 盒${Math.round(box.width)}×${Math.round(box.height)}`;
 	}
 
 	private stopPolling(): void {

@@ -62,7 +62,8 @@ const XHS_UTC_OFFSET_MIN = 8 * 60;
 
 export default class RedNoteSyncPlugin extends Plugin {
 	settings: RedNoteSyncSettings = { ...DEFAULT_SETTINGS };
-	private session = new RedNoteSession();
+	/** Shared webview session (used by the settings tab's logout button). */
+	readonly session = new RedNoteSession();
 	private syncing = false;
 	/** Guard against re-entrant login modals fighting over one resident webview. */
 	/** Live settings tab reference so login-state changes can re-render it. */
@@ -298,10 +299,25 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("登录小红书")
-			.setDesc("打开内嵌登录窗口（扫码 / 密码登录），会话由插件保持")
+			.setDesc("打开内嵌登录页（扫码 / 密码登录），会话由插件保持。登录状态由插件自动检测，开关仅作展示。")
 			.addButton((b) => {
-				b.setButtonText("打开登录窗口").onClick(() => {
+				b.setButtonText("打开登录页").onClick(() => {
 					this.plugin.openLogin();
+				});
+			})
+			.addButton((b) => {
+				b.setButtonText("退出登录").onClick(async () => {
+					b.setDisabled(true);
+					new Notice("正在退出登录…");
+					try {
+						await this.plugin.session.logout();
+					} catch (e) {
+						console.warn("[pull-rednote] logout failed:", e);
+					}
+					this.plugin.settings.loginStatus = false;
+					await this.plugin.saveSettings();
+					new Notice("已退出小红书登录");
+					this.display();
 				});
 			});
 

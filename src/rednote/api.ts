@@ -632,18 +632,16 @@ export class RedNoteSession {
 	}
 
 	async checkLogin(): Promise<boolean> {
-		// UNSIGNED first: a successful QR login was misreported as "not logged
-		// in" because the signed path died at the (optional) page sign function
-		// before the request was ever sent. selfinfo is cookie-only (pong).
+		// Structured stage labels so the status line shows WHICH stage said what
+		// (a hung stage is identifiable by its missing label).
 		this.lastCheckInfo = null;
+		const parts: string[] = [];
 		let sawAuthyNo = false;
 		for (const unsigned of [true, false]) {
+			const label = unsigned ? "无签名" : "签名";
 			try {
 				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
 				const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-				// Tolerant response shapes: MediaCrawler documents
-				// {data:{result:{success:true,...}}}; a 2026 variant may put the
-				// user info directly under data without result.success.
 				if (result?.success === true) {
 					return true;
 				}
@@ -653,26 +651,20 @@ export class RedNoteSession {
 				) {
 					return true;
 				}
-				this.lastCheckInfo = "selfinfo 响应不含登录成功标记";
+				parts.push(`${label}=响应无登录标记`);
 				sawAuthyNo = true;
 				break;
 			} catch (e) {
 				if (e instanceof NotLoggedInError) {
+					parts.push(`${label}=拒`);
 					sawAuthyNo = true;
-					this.lastCheckInfo = `${e.message}（unsigned=${unsigned}）`;
 					if (!unsigned) {
-						// The SIGNED attempt (locally computed X-S/X-T) also says
-						// no — that is a real logged-out verdict.
 						break;
 					}
-					// An UNSIGNED "no" is ambiguous in 2026 (the same envelope
-					// comes back for "merely unsigned") — fall through and try
-					// the signed attempt before concluding anything.
+					// An UNSIGNED "no" is ambiguous in 2026 — try signed next.
 					continue;
 				}
-				this.lastCheckInfo = `selfinfo 请求失败（unsigned=${unsigned}）：${
-					e instanceof Error ? e.message : String(e)
-				}`;
+				parts.push(`${label}=错:${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`);
 				console.warn(
 					`[pull-rednote] checkLogin attempt (unsigned=${unsigned}) failed:`,
 					e instanceof Error ? e.message : e,
@@ -680,14 +672,47 @@ export class RedNoteSession {
 			}
 		}
 		if (sawAuthyNo) {
+			parts.push("页面探测…");
 			const page = await this.checkLoginViaPage();
 			if (page.ok) {
 				this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;
 				return true;
 			}
-			this.lastCheckInfo = `${this.lastCheckInfo ?? ""}；${page.info}`;
+			parts.push(`页面=否（${page.info.slice(0, 90)}）`);
 		}
+		this.lastCheckInfo = parts.join("；");
 		return false;
+	}
+
+	/**
+	 * Log out: ask XHS to invalidate the session server-side (the exit
+	 * endpoint is the only way to kill the httpOnly web_session cookie),
+	 * expire every locally readable cookie, then drop the webview element so
+	 * the next use starts from a fresh page.
+	 */
+	async logout(): Promise<void> {
+		try {
+			const code = `fetch("https://edith.xiaohongshu.com/api/sns/web/v1/login/exit", {method:"POST", credentials:"include", headers:{"content-type":"application/json;charset=UTF-8"}}).then(r => String(r.status)).catch(e => String(e).slice(0, 80))`;
+			const res = await this.eval<string>(code);
+			console.log("[pull-rednote] logout exit endpoint:", res);
+		} catch (e) {
+			console.warn("[pull-rednote] logout exit endpoint failed:", e);
+		}
+		try {
+			const clear = `(() => {
+				document.cookie.split(";").forEach((c) => {
+					const n = c.split("=")[0].trim();
+					if (!n) return;
+					document.cookie = n + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/;domain=.xiaohongshu.com";
+					document.cookie = n + "=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/";
+				});
+				return String(document.cookie.length);
+			})()`;
+			await this.eval<string>(clear);
+		} catch {
+			// Non-fatal: the server-side exit above is the authoritative logout.
+		}
+		this.destroy();
 	}
 
 	/**
