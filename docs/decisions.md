@@ -136,3 +136,14 @@
 - request() 增加 REQ 级日志（uri/status/code/success 全留痕）；runSync 的 NotLoggedInError 先页面探测再决定是否翻转登录态（杜绝"登录失效"误报）
 - 证据：build exit 0、89/89 单测（+5 XYW）、已部署 vault
 - 最终未知数（诚实）：服务端是否接受 XYW_ 待真机同步实测，debug.log 的 REQ 行会直接给出答案
+
+## ADR-016 AI 处理视频时抽取重要片段关键帧（2026-09-15，用户需求）
+
+- 需求：AI 转写视频（M4 轨道①）时，**按重要程度**抽取视频关键片段的关键帧并存入媒体目录
+- 设计要点：
+  - **重要性判定**：由同一次多模态转写调用顺带产出——prompt 要求模型在转写的同时返回"关键时刻"列表（`[{t: 秒, why: 一句话}]`，按重要性排序，数量可配，默认 3-5 帧），不加额外调用成本
+  - **抽帧实现（插件侧，不引入 ffmpeg——沿 ADR-005 的无 ffmpeg 约束）**：HTML5 `<video>` 元素 seek 到时间点 → `canvas.drawImage` → `toBlob` 存 PNG/JPG（Obsidian renderer 支持，vault 资源经 resource URL 可读）；轨道②（ZCode 执行）可直接用本机 ffmpeg 抽帧
+  - **存储**：`RedNote/Media/{note_id}/kf-{序号}-{时间戳}.jpg`；AI 小节中以缩略图+时间戳列表嵌入（点击跳转视频对应位置以链接形式）
+  - **设置**：`aiKeyframesEnabled`（默认关）、`aiKeyframeCount`（默认 4，可调 1-10）
+  - **降级**：视频时长过短（<10s）或模型未返回时间戳时不抽帧，只在转写稿里保留文字
+- 归属：M4 实现清单（features.md #18）；依赖 M3 的视频本地下载（需本地文件才能 seek 抽帧）
