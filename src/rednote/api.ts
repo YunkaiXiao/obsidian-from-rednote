@@ -128,6 +128,22 @@ export class RedNoteSession {
 		if (this.webview) {
 			return this.webview;
 		}
+		// RECLAIM before creating: after a destroy/recreate cycle the login
+		// leaf may still hold a LIVE webview of ours while this method would
+		// create a SECOND one — the split (visible page vs. eval target) made
+		// every check talk to the wrong page (observed: DOM webview×2).
+		const existing = document.querySelector(
+			`webview[partition="${WEBVIEW_PARTITION}"]`,
+		) as WebviewEl | null;
+		if (existing) {
+			this.log("reclaim: adopting existing live webview from the document");
+			this.webview = existing;
+			this.container = existing.parentElement;
+			// The reclaimed page is already loaded (best effort — a queued
+			// executeJavaScript would wait for load anyway).
+			this.readyPromise = Promise.resolve();
+			return existing;
+		}
 		const el = document.createElement("webview") as WebviewEl;
 		// CRITICAL (white-screen root cause): Electron's <webview> is ATTRIBUTE-
 		// driven (attributeChangedCallback). Plain property assignment
@@ -600,7 +616,7 @@ export class RedNoteSession {
 		// GUEST_VIEW_MANAGER_CALL error. Every access is wrapped so the eval
 		// always resolves with a JSON summary.
 		const code = `(() => {
-			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR" };
+			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent" };
 			try { out.cookieA1 = /(?:^|; )a1=/.test(document.cookie); } catch (e) {}
 			try {
 				const st = window.__INITIAL_STATE__ || {};
@@ -608,7 +624,16 @@ export class RedNoteSession {
 				const user = st.user || {};
 				const keys = Object.keys(user);
 				out.userKeys = keys.slice(0, 6).join(",");
-				out.hasUserData = keys.length > 0 && JSON.stringify(user).length > 10;
+				// DO NOT use JSON.stringify(user) as the signal: the XHS user
+				// object is not serializable (circular / guarded getters), the
+				// stringify throws and used to leave hasUserData false even on
+				// a logged-in page. The authoritative signal is the explicit
+				// loggedIn boolean field.
+				out.hasUserData = keys.length > 0;
+				try {
+					const lv = user.loggedIn;
+					out.loggedIn = lv === true ? "true" : lv === false ? "false" : String(lv).slice(0, 12);
+				} catch (e2) { out.loggedIn = "throw"; }
 			} catch (e) {
 				out.stateKeys = "PROBE_THROW:" + String(e).slice(0, 60);
 			}
@@ -622,6 +647,7 @@ export class RedNoteSession {
 						userKeys?: string;
 						cookieA1?: boolean;
 						stateKeys?: string;
+						loggedIn?: string;
 					})
 				: null;
 			if (!p) {
@@ -629,9 +655,13 @@ export class RedNoteSession {
 			}
 			const stateKeys = (p.stateKeys ?? "").slice(0, 80);
 			const info =
-				`页面侧 INITIAL_STATE.user=${p.userKeys || "无"}，a1=${p.cookieA1 ? "有" : "无"}` +
+				`页面侧 loggedIn=${p.loggedIn ?? "?"}，INITIAL_STATE.user=${p.userKeys || "无"}` +
+				`，a1=${p.cookieA1 ? "有" : "无"}` +
 				`，state keys=${stateKeys || "无"}`;
-			return { ok: Boolean(p.hasUserData), info };
+			// loggedIn === true is the authoritative signal; fall back to
+			// hasUserData only when the field is absent (unexpected shape).
+			const ok = p.loggedIn === "true" || (p.loggedIn !== "false" && Boolean(p.hasUserData));
+			return { ok, info };
 		} catch (e) {
 			return { ok: false, info: `页面探测失败：${e instanceof Error ? e.message : String(e)}` };
 		}
