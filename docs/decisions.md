@@ -128,3 +128,11 @@
 - getSign 新顺序：eval 读 a1(localStorage b1) → 本地签名 → 页面函数回退 → 双失败 SignError；GET 查询编码改 `quote(safe=',')` 配对签名串
 - 高度根因：CSS 类 `height:100%!important` 压过内联 px；修复=去 !important + applySize 测 contentEl 写三层内联 px + 清除容器离屏内联样式（必要配套，否则页面整体不可见）
 - **已知风险（真机验证焦点）**：xhshow 文档提示 ~2026-03 起部分接口对 XYS_ 格式 X-S 返回 406，需 XYW_（AES-128-CBC）变体——未移植，若同步报 406 再补；localStorage.b1 是否存在未验证
+
+## ADR-015 XYW_ 签名变体与误报修正（2026-09-15，9ad7007）
+
+- 真机证据链闭环：用户已登录（页面探测 true）但同步的 XYS_ 签名请求 collect/page 被拒（success:false→被误报"登录失效"）→ 与 xhshow 文档"2026-03 起部分接口拒 XYS_、需 XYW_"吻合
+- 移植：XYW_（AES-128-CBC，key/IV 为 xhshow 硬编码常量，纯 TS FIPS-197 实现保持同步接口）——与 xhshow **真实包**重跑黄金向量 6/6 逐字节一致（非镜像脚本）；XYS_ 保留备用；上轮中断尝试遗留的 AES 明文填充 bug（应 pad base64 文本字节而非解码原文）一并修复
+- request() 增加 REQ 级日志（uri/status/code/success 全留痕）；runSync 的 NotLoggedInError 先页面探测再决定是否翻转登录态（杜绝"登录失效"误报）
+- 证据：build exit 0、89/89 单测（+5 XYW）、已部署 vault
+- 最终未知数（诚实）：服务端是否接受 XYW_ 待真机同步实测，debug.log 的 REQ 行会直接给出答案
