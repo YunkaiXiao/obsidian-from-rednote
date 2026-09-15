@@ -1,22 +1,27 @@
 /* Pull Rednote plugin styles */
 
-/* Login leaf layout. The webview box is sized in inline px by the view's
-   applySize() (measuring the leaf content box); these classes only provide
-   layout hints and minimum-size fallbacks. Do NOT add width/height:100% or
-   !important here — 100% beats the measured px (fixed-height strip bug) and
-   !important would override the JS sizing entirely. */
+/* Login leaf layout. The stage is a relative box sized by applySize() from
+   the leaf's real content box; container and webview FILL it via absolute
+   positioning — their size is derived by the layout engine from the
+   containing block in real time, so no stale inline px can stick and the
+   geometry cannot collapse behind a stale guest viewport. */
 .pull-rednote-login-stage {
 	position: relative;
 	min-height: 200px;
 }
 
 .pull-rednote-login-container {
-	position: static;
-	left: auto;
-	top: auto;
+	position: absolute !important;
+	inset: 0 !important;
+	width: auto !important;
+	height: auto !important;
 }
 
 .pull-rednote-login-webview {
+	position: absolute !important;
+	inset: 0 !important;
+	width: 100% !important;
+	height: 100% !important;
 	min-width: 320px;
 	min-height: 240px;
 }

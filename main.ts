@@ -190,10 +190,24 @@ export default class RedNoteSyncPlugin extends Plugin {
 			return;
 		}
 
-		// Gate 1: login. (If never logged in, guide to the login modal.)
+		// Gate 1: login. The persisted flag can be STALE (a historical
+		// misreport once flipped it false while the session was alive), so
+		// when it says no, verify against the live page before blocking.
 		if (!this.settings.loginStatus) {
-			new Notice("尚未登录小红书，请先打开「Pull Rednote：打开登录窗口」登录", 8000);
-			return;
+			let actually = false;
+			try {
+				actually = await this.session.checkLogin();
+			} catch {
+				actually = false;
+			}
+			if (actually) {
+				this.settings.loginStatus = true;
+				await this.saveSettings();
+				this.settingTab?.display();
+			} else {
+				new Notice("尚未登录小红书，请先打开「Pull Rednote：打开登录页」登录", 8000);
+				return;
+			}
 		}
 		// Gate 2: confirm the session is actually still valid (the webview may
 		// have lost it). Re-verify via the selfinfo endpoint.
