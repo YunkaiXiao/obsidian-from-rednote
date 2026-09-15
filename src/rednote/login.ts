@@ -33,6 +33,7 @@ export class RedNoteLoginView extends ItemView {
 	private statusHandlers: Array<[string, EventListener]> = [];
 	private watchdogTimer: number | null = null;
 	private pollTimer: number | null = null;
+	private censusTimer: number | null = null;
 	private pollFailures = 0;
 	private finished = false;
 	private stageSize = { w: 480, h: 640 };
@@ -297,6 +298,14 @@ export class RedNoteLoginView extends ItemView {
 	private startPolling(): void {
 		this.stopPolling();
 		this.pollFailures = 0;
+		// Periodic census log (independent of poll success/failure) so the
+		// layout data is always captured while the login view is open.
+		this.censusTimer = window.setInterval(() => {
+			if (this.finished) {
+				return;
+			}
+			this.session.log(`登录页：${this.domCensus()} 目标${this.stageSize.w}×${this.stageSize.h}`);
+		}, 30000);
 		const check = async (): Promise<void> => {
 			if (this.finished) {
 				return;
@@ -386,6 +395,10 @@ export class RedNoteLoginView extends ItemView {
 		if (this.pollTimer != null) {
 			window.clearTimeout(this.pollTimer);
 			this.pollTimer = null;
+		}
+		if (this.censusTimer != null) {
+			window.clearInterval(this.censusTimer);
+			this.censusTimer = null;
 		}
 	}
 }
