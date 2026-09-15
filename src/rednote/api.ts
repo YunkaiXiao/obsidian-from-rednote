@@ -710,53 +710,43 @@ export class RedNoteSession {
 	}
 
 	async checkLogin(): Promise<boolean> {
+		// SIGNED ONLY: unsigned selfinfo is a guaranteed HTTP 406 in 2026 —
+		// every unsigned attempt is pure risk-control noise (hours of 2s
+		// polling with unsigned-first eventually got the whole session 406-
+		// blocked on the server side). The page probe remains the fallback.
 		this.lastCheckInfo = null;
 		const parts: string[] = [];
-		let sawAuthyNo = false;
-		for (const unsigned of [true, false]) {
-			const label = unsigned ? "无签名" : "签名";
-			try {
-				const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned });
-				const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-				if (result?.success === true) {
-					return true;
-				}
-				if (
-					result?.success === undefined &&
-					(result?.basic_info != null || result?.user_id != null)
-				) {
-					return true;
-				}
-				parts.push(`${label}=响应无登录标记`);
-				sawAuthyNo = true;
-				break;
-			} catch (e) {
-				if (e instanceof NotLoggedInError) {
-					parts.push(`${label}=拒`);
-					sawAuthyNo = true;
-					if (!unsigned) {
-						break;
-					}
-					// An UNSIGNED "no" is ambiguous in 2026 — try signed next.
-					continue;
-				}
-				parts.push(`${label}=错:${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`);
-				console.warn(
-					`[pull-rednote] checkLogin attempt (unsigned=${unsigned}) failed:`,
-					e instanceof Error ? e.message : e,
-				);
-			}
-		}
-		if (sawAuthyNo) {
-			parts.push("页面探测…");
-			const page = await this.checkLoginViaPage();
-			if (page.ok) {
-				this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;
-				this.log(`checkLogin -> true（${this.lastCheckInfo}）`);
+		try {
+			const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, {});
+			const result = (data?.result ?? data) as Record<string, unknown> | undefined;
+			if (result?.success === true) {
 				return true;
 			}
-			parts.push(`页面=否（${page.info.slice(0, 90)}）`);
+			if (
+				result?.success === undefined &&
+				(result?.basic_info != null || result?.user_id != null)
+			) {
+				return true;
+			}
+			parts.push("签名=响应无登录标记");
+		} catch (e) {
+			if (e instanceof NotLoggedInError) {
+				parts.push("签名=拒");
+			} else {
+				parts.push(
+					`签名=错:${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
+				);
+				console.warn("[pull-rednote] checkLogin signed failed:", e);
+			}
 		}
+		parts.push("页面探测…");
+		const page = await this.checkLoginViaPage();
+		if (page.ok) {
+			this.lastCheckInfo = `接口未确认但页面已登录（${page.info}）`;
+			this.log(`checkLogin -> true（${this.lastCheckInfo}）`);
+			return true;
+		}
+		parts.push(`页面=否（${page.info.slice(0, 90)}）`);
 		this.lastCheckInfo = parts.join("；");
 		this.log(`checkLogin -> false：${this.lastCheckInfo}`);
 		return false;
@@ -800,11 +790,13 @@ export class RedNoteSession {
 	 * Derived from selfinfo.
 	 */
 	async getSelfUserId(): Promise<string> {
+		// SIGNED ONLY (unsigned selfinfo is a guaranteed 406 / risk noise).
 		let data: Record<string, unknown>;
 		try {
-			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, { unsigned: true });
-		} catch {
-			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {});
+			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, {});
+		} catch (e) {
+			this.log(`getSelfUserId 请求失败：${e instanceof Error ? e.message.slice(0, 100) : String(e).slice(0, 100)}`);
+			return "";
 		}
 		// Tolerant extraction across known/possible 2026 envelope shapes; when
 		// nothing matches, log the REAL payload shape so the next round can

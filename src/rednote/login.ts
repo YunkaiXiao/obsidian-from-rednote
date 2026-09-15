@@ -330,9 +330,9 @@ export class RedNoteLoginView extends ItemView {
 					e instanceof Error ? e.message : e,
 				);
 			}
-			this.pollTimer = window.setTimeout(check, 2000);
+			this.pollTimer = window.setTimeout(check, 4000);
 		};
-		this.pollTimer = window.setTimeout(check, 2000);
+		this.pollTimer = window.setTimeout(check, 4000);
 	}
 
 	/** If the stage has NO webview at all (e.g. logout destroyed it), adopt
@@ -375,7 +375,8 @@ export class RedNoteLoginView extends ItemView {
 		const els = Array.from(document.querySelectorAll("webview"));
 		const rects = els.map((el) => {
 			const r = el.getBoundingClientRect();
-			return `${Math.round(r.width)}×${Math.round(r.height)}`;
+			const cs = getComputedStyle(el);
+			return `${Math.round(r.width)}×${Math.round(r.height)}(css ${cs.position},${cs.width},${cs.height})`;
 		});
 		const box = this.contentEl.getBoundingClientRect();
 		return `DOM webview×${els.length}[${rects.join(", ")}] 盒${Math.round(box.width)}×${Math.round(box.height)}`;
