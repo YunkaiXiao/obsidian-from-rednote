@@ -285,10 +285,28 @@ export default class RedNoteSyncPlugin extends Plugin {
 			new Notice(makeSummaryNotice(result), 8000);
 		} catch (e) {
 			if (e instanceof NotLoggedInError) {
-				this.settings.loginStatus = false;
-				// newIds already persisted incrementally -> not lost here.
-				await this.saveSettings();
-				new Notice(`登录失效：${e.message}。请重新打开登录窗口（已同步的 ${newIds.size} 篇已保留）`, 12000);
+				// A signed request being rejected is NOT proof the login expired:
+				// signature/anti-crawl rejection returns the same {success:false}
+				// envelope. Cross-check with the page-side probe BEFORE flipping
+				// loginStatus — only flip when the page itself says logged out.
+				let page = { ok: false, info: "页面探测异常" };
+				try {
+					page = await this.session.checkLoginViaPage();
+				} catch (probeErr) {
+					page = { ok: false, info: probeErr instanceof Error ? probeErr.message : String(probeErr) };
+				}
+				this.session.log(`runSync NotLoggedInError -> 页面探测 ok=${page.ok}（${page.info}）`);
+				if (page.ok) {
+					new Notice(
+						`接口拒绝了请求（疑似签名/风控），详情见 debug.log。已同步的 ${newIds.size} 篇已保留`,
+						12000,
+					);
+				} else {
+					this.settings.loginStatus = false;
+					// newIds already persisted incrementally -> not lost here.
+					await this.saveSettings();
+					new Notice(`登录失效：${e.message}。请重新打开登录窗口（已同步的 ${newIds.size} 篇已保留）`, 12000);
+				}
 			} else if (e instanceof SignError) {
 				new Notice(`签名失败：${e.message}`, 10000);
 			} else {

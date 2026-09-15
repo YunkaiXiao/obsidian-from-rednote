@@ -25,7 +25,10 @@ import {
 } from "./types";
 import { parseListPage, shouldContinue, type RawListData } from "./pagination";
 import { mergeNoteCard } from "./extract";
-import { xhsSign, generateB1, xhsQueryEscape } from "./sign";
+// xhsSignXyw = CURRENT XYW_ (AES-128-CBC) X-S format. The legacy XYS_ variant
+// (xhsSign) stays in sign.ts as a backup path — since ~2026-03 data-fetching
+// APIs reject XYS_ with {success:false}.
+import { xhsSignXyw, generateB1, xhsQueryEscape } from "./sign";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
@@ -402,10 +405,11 @@ export class RedNoteSession {
 			);
 		}
 
-		// (2) LOCAL signing (primary).
+		// (2) LOCAL signing (primary) — XYW_ (AES-128-CBC) format, required by
+		// data-fetching APIs since ~2026-03 (XYS_ gets {success:false}).
 		if (a1) {
 			try {
-				const sign = xhsSign(uri, method, data, a1, b1 || generateB1());
+				const sign = xhsSignXyw(uri, method, data, a1, b1 || generateB1());
 				return sign;
 			} catch (e) {
 				console.warn(
@@ -550,13 +554,29 @@ export class RedNoteSession {
 				});
 			})()
 		`;
-		const raw = await this.eval<string>(code);
-		const parsed = raw ? JSON.parse(raw) : null;
+		// One REQ line per request in debug.log (session.log), including every
+		// failure/exception branch below — the sync path stays fully traceable.
+		const reqTag = `REQ ${method} ${uri.slice(0, 60)}`;
+		let parsed: { status: number; json: Record<string, unknown> | null; text?: string } | null = null;
+		try {
+			const raw = await this.eval<string>(code);
+			parsed = raw ? JSON.parse(raw) : null;
+		} catch (e) {
+			this.log(`${reqTag} -> EXC ${e instanceof Error ? e.message : String(e)}`);
+			throw e;
+		}
 		if (!parsed) {
+			this.log(`${reqTag} -> ERR 无返回`);
 			throw new FetchError(`请求 ${uri} 无返回`);
 		}
 
 		const status = parsed.status as number;
+		{
+			const j = parsed.json;
+			const codeStr = j && j.code != null ? String(j.code) : "-";
+			const successStr = j && j.success != null ? String(j.success) : "-";
+			this.log(`${reqTag} -> HTTP${status} code=${codeStr} success=${successStr}`);
+		}
 		if (status === 401 || status === 403) {
 			throw new NotLoggedInError("登录已失效，请重新登录");
 		}

@@ -83,6 +83,24 @@ const B1_SECRET_KEY = "xhswebmplfbt";
 
 const HEX_CHARS = "abcdef0123456789";
 
+// ---------------------------------------------------------------------------
+// XYW_ (AES-128-CBC) constants — verbatim from xhshow CryptoConfig.XYW_* block.
+// Used by data-fetching APIs (collect/page, feed, user_posted) that reject the
+// XYS_ format with HTTP 406 / {success:false} since ~March 2026.
+// ---------------------------------------------------------------------------
+
+/** XYW_ prefix (XYS_ is the old X-S envelope). */
+const XYW_PREFIX = "XYW_";
+const XYW_SIGN_SVN = "56";
+const XYW_SIGN_TYPE = "x2";
+const XYW_SIGN_VERSION = "1";
+/** AES-128 key (16 ASCII bytes) — CryptoConfig.XYW_AES_KEY. */
+const XYW_AES_KEY = "7cc4adla5ay0701v";
+/** AES-CBC IV (16 ASCII bytes) — CryptoConfig.XYW_AES_IV. */
+const XYW_AES_IV = "4uzjr7mbsibcaldp";
+/** Default environment flags x2 field — CryptoConfig.XYW_ENV_FLAGS_DEFAULT. */
+const XYW_ENV_FLAGS_DEFAULT = "0|0|0|1|0|0|1|0|0|0|1|0|0|0|0|1|0|0|1";
+
 const encoder = new TextEncoder();
 
 function utf8Bytes(s: string): number[] {
@@ -151,6 +169,188 @@ export function decodeCustomBase64(encoded: string): string {
 		}
 	}
 	return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+// ---------------------------------------------------------------------------
+// Standard base64 (used only for the XYW_ payload: base64(text) then AES, and
+// the XYW_ envelope which is standard base64 of the JSON). Pure — the renderer
+// has no synchronous Node crypto, so we implement it and AES by hand.
+// ---------------------------------------------------------------------------
+
+/** Standard-alphabet base64 encoder (RFC 4648, with padding). */
+function stdB64Encode(data: number[]): string {
+	return b64EncodeWith(data, STD_B64);
+}
+
+// ---------------------------------------------------------------------------
+// AES-128-CBC (pure TS, FIPS-197, mirrors xhshow core/xyw_crypto.py).
+// Synchronous on purpose: the renderer has no synchronous Node crypto and
+// window.crypto.subtle is async, which would break the existing sync signing
+// path. Verified byte-for-byte against xhshow's AES (see tests/sign.test.ts).
+// ---------------------------------------------------------------------------
+
+const S_BOX: number[] = (() => {
+	// Verbatim AES S-box (FIPS-197 / xhshow core/xyw_crypto.py S_BOX).
+	const hex =
+		"637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0" +
+		"b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275" +
+		"09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf" +
+		"d0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2" +
+		"cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb" +
+		"e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08" +
+		"ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e" +
+		"e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16";
+	const out: number[] = [];
+	for (let i = 0; i < hex.length; i += 2) {
+		out.push(parseInt(hex.slice(i, i + 2), 16));
+	}
+	return out;
+})();
+
+const RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+
+const _xtime = (value: number): number => {
+	let v = value << 1;
+	if (v & 0x100) {
+		v ^= 0x11b;
+	}
+	return v & 0xff;
+};
+
+/** AES-128 key expansion -> 11 round keys, each a 16-byte number[]. */
+function aesExpandKey(key: number[]): number[][] {
+	if (key.length !== 16) {
+		throw new Error("AES-128 requires a 16-byte key");
+	}
+	const words: number[][] = [];
+	for (let i = 0; i < 16; i += 4) {
+		words.push([key[i]!, key[i + 1]!, key[i + 2]!, key[i + 3]!]);
+	}
+	while (words.length < 44) {
+		let temp = words[words.length - 1]!.slice();
+		if (words.length % 4 === 0) {
+			const rotated = [temp[1]!, temp[2]!, temp[3]!, temp[0]!];
+			temp = rotated.map((b) => S_BOX[b]!);
+			temp[0] = temp[0]! ^ RCON[words.length / 4 - 1]!;
+		}
+		const prev = words[words.length - 4]!;
+		words.push([
+			prev[0]! ^ temp[0]!,
+			prev[1]! ^ temp[1]!,
+			prev[2]! ^ temp[2]!,
+			prev[3]! ^ temp[3]!,
+		]);
+	}
+	const roundKeys: number[][] = [];
+	for (let r = 0; r < 11; r++) {
+		const rk: number[] = [];
+		for (const w of words.slice(r * 4, r * 4 + 4)) {
+			rk.push(...w);
+		}
+		roundKeys.push(rk);
+	}
+	return roundKeys;
+}
+
+function aesEncryptBlock(block: number[], roundKeys: number[][]): number[] {
+	const state = block.slice();
+	const addRoundKey = (rk: number[]): void => {
+		for (let i = 0; i < 16; i++) {
+			state[i] = state[i]! ^ rk[i]!;
+		}
+	};
+	const subBytes = (): void => {
+		for (let i = 0; i < 16; i++) {
+			state[i] = S_BOX[state[i]!]!;
+		}
+	};
+	const shiftRows = (): void => {
+		// xhshow layout: row `r` lives at state[r + 4*col] (col 0..3), i.e.
+		// state[r], state[r+4], state[r+8], state[r+12]; each column c =
+		// state[c*4 .. c*4+3]. Row 0 is not shifted; rows 1..3 rotate left by
+		// their index. (This matches xhshow core/xyw_crypto.py _shift_rows exactly.)
+		for (let row = 1; row < 4; row++) {
+			const rowBytes = [state[row]!, state[row + 4]!, state[row + 8]!, state[row + 12]!];
+			const shifted = rowBytes.slice(row).concat(rowBytes.slice(0, row));
+			for (let col = 0; col < 4; col++) {
+				state[row + 4 * col] = shifted[col]!;
+			}
+		}
+	};
+	const mixColumns = (): void => {
+		for (let col = 0; col < 4; col++) {
+			const s = col * 4;
+			const a0 = state[s]!, a1 = state[s + 1]!, a2 = state[s + 2]!, a3 = state[s + 3]!;
+			state[s] = _xtime(a0) ^ (_xtime(a1) ^ a1) ^ a2 ^ a3;
+			state[s + 1] = a0 ^ _xtime(a1) ^ (_xtime(a2) ^ a2) ^ a3;
+			state[s + 2] = a0 ^ a1 ^ _xtime(a2) ^ (_xtime(a3) ^ a3);
+			state[s + 3] = (_xtime(a0) ^ a0) ^ a1 ^ a2 ^ _xtime(a3);
+		}
+	};
+
+	addRoundKey(roundKeys[0]!);
+	for (let r = 1; r < 10; r++) {
+		subBytes();
+		shiftRows();
+		mixColumns();
+		addRoundKey(roundKeys[r]!);
+	}
+	subBytes();
+	shiftRows();
+	addRoundKey(roundKeys[10]!);
+	return state;
+}
+
+/**
+ * AES-128-CBC encrypt. `plaintext` MUST already be a multiple of 16 bytes
+ * (PKCS#7 is applied by the caller, matching xhshow). Returns ciphertext bytes.
+ */
+export function aes128CbcEncrypt(key: number[], iv: number[], plaintext: number[]): number[] {
+	if (key.length !== 16 || iv.length !== 16) {
+		throw new Error("AES-128-CBC: key and IV must each be 16 bytes");
+	}
+	if (plaintext.length % 16 !== 0) {
+		throw new Error("AES-128-CBC: plaintext must be PKCS#7 padded to a 16-byte boundary");
+	}
+	const roundKeys = aesExpandKey(key);
+	const out: number[] = [];
+	let previous = iv.slice();
+	for (let off = 0; off < plaintext.length; off += 16) {
+		const block = plaintext.slice(off, off + 16);
+		const chained = block.map((b, i) => (b ^ previous[i]!) & 0xff);
+		const enc = aesEncryptBlock(chained, roundKeys);
+		out.push(...enc);
+		previous = enc;
+	}
+	return out;
+}
+
+/** PKCS#7 pad to a 16-byte boundary (xhshow _pkcs7_pad). */
+function pkcs7Pad(data: number[]): number[] {
+	const padLen = 16 - (data.length % 16);
+	const out = data.slice();
+	for (let i = 0; i < padLen; i++) {
+		out.push(padLen);
+	}
+	return out;
+}
+
+/**
+ * xhshow build_xyw_payload_hex: md5 of the content string -> message
+ * "x1=..;x2=..;x3=a1;x4=ts;" -> standard base64 -> PKCS#7 -> AES-128-CBC ->
+ * lowercase hex.
+ */
+function buildXywPayloadHex(fullUri: string, a1Value: string, timestampMs: string): string {
+	const x1 = md5Hex("url=" + fullUri);
+	const message = `x1=${x1};x2=${XYW_ENV_FLAGS_DEFAULT};x3=${a1Value};x4=${timestampMs};`;
+	// xhshow pads the BASE64 TEXT bytes (base64.b64encode(message) -> _pkcs7_pad),
+	// not the original message — do not decode the base64 back.
+	const base64 = stdB64Encode(utf8Bytes(message));
+	const plaintext = pkcs7Pad(utf8Bytes(base64));
+	const key = utf8Bytes(XYW_AES_KEY);
+	const iv = utf8Bytes(XYW_AES_IV);
+	const cipher = aes128CbcEncrypt(key, iv, plaintext);
+	return cipher.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +718,14 @@ function buildPayloadArray(
 	return payload;
 }
 
-/** X-S in the XYS_ format MediaCrawler/xhshow use (their default). */
+/**
+ * X-S in the XYS_ format (old format).
+ *
+ * NOTE: This is the LEGACY signature format. Since ~March 2026, XHS data-fetching
+ * APIs (collect/page, feed, user_posted) reject XYS_ with {success:false} / HTTP
+ * 406 and require the XYW_ (AES-128-CBC) variant — see signXyw below. Kept (not
+ * deleted) as a backup path; the live request path uses XYW_ via xhsSignXyw.
+ */
 function signXs(
 	method: "GET" | "POST",
 	uri: string,
@@ -543,6 +750,38 @@ function signXs(
 	};
 	signatureData["x3"] = "mns0301_" + x3;
 	return "XYS_" + customB64(utf8Bytes(JSON.stringify(signatureData)));
+}
+
+/**
+ * X-S in the XYW_ format (AES-128-CBC). The current format for data-fetching
+ * APIs; independent crypto path from signXs (no custom base64, no custom hash,
+ * no payload array — just md5(content) folded into an AES-encrypted message).
+ *
+ * Structure: "XYW_" + standardBase64( compact JSON {
+ *   signSvn:"56", signType:"x2", appId, signVersion:"1",
+ *   payload: hex( AES-128-CBC( PKCS7( base64( "x1=md5(url=content);x2=flags;x3=a1;x4=ts;" ) ) ) )
+ * } ). Mirrors xhshow client.sign_xyw + core.xyw_crypto.build_xyw_payload_hex.
+ *
+ * @param nowMs epoch milliseconds (x4 = String(nowMs))
+ */
+export function signXyw(
+	method: "GET" | "POST",
+	uri: string,
+	a1Value: string,
+	data: unknown,
+	nowMs: number,
+): string {
+	const contentString = buildContentString(method, uri, data);
+	const payloadHex = buildXywPayloadHex(contentString, a1Value, String(nowMs));
+	// Key order matters (JSON object insertion order is part of the format).
+	const xywData: Record<string, string> = {
+		signSvn: XYW_SIGN_SVN,
+		signType: XYW_SIGN_TYPE,
+		appId: "xhs-pc-web",
+		signVersion: XYW_SIGN_VERSION,
+		payload: payloadHex,
+	};
+	return XYW_PREFIX + stdB64Encode(utf8Bytes(JSON.stringify(xywData)));
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +921,31 @@ export function xhsSign(
 	const b1Value = b1 || generateB1(ms);
 	return {
 		"X-S": signXs(method, uri, a1, data, ms, rnd),
+		"X-T": String(ms),
+		"x-s-common": signXsCommon(a1, b1Value),
+		"X-B3-Traceid": Array.from({ length: 16 }, () => HEX_CHARS[Math.floor(Math.random() * HEX_CHARS.length)]).join(""),
+	};
+}
+
+/**
+ * Compute XHS signed headers using the CURRENT XYW_ (AES-128-CBC) X-S format.
+ *
+ * x-s-common and X-B3-Traceid are identical to xhsSign; only the X-S format
+ * differs (XYW_ instead of the legacy XYS_). Data-fetching APIs require this
+ * form since ~March 2026. See signXyw for the algorithm.
+ */
+export function xhsSignXyw(
+	uri: string,
+	method: "GET" | "POST",
+	data: unknown,
+	a1: string,
+	b1: string,
+	nowMs?: number,
+): XhsSignResult {
+	const ms = nowMs ?? Date.now();
+	const b1Value = b1 || generateB1(ms);
+	return {
+		"X-S": signXyw(method, uri, a1, data, ms),
 		"X-T": String(ms),
 		"x-s-common": signXsCommon(a1, b1Value),
 		"X-B3-Traceid": Array.from({ length: 16 }, () => HEX_CHARS[Math.floor(Math.random() * HEX_CHARS.length)]).join(""),
