@@ -352,6 +352,17 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
+			.setName("同步收藏")
+			.setDesc(
+				"立即拉取小红书收藏并写入笔记目录（受限速约束）。也可用左侧栏书签图标或命令面板触发。",
+			)
+			.addButton((b) => {
+				b.setButtonText("立即同步").setCta().onClick(() => {
+					void this.plugin.runSync();
+				});
+			});
+
+		new Setting(containerEl)
 			.setName("上次同步")
 			.setDesc(settings.lastSyncAt || "（尚未同步）");
 
