@@ -147,3 +147,11 @@
   - **设置**：`aiKeyframesEnabled`（默认关）、`aiKeyframeCount`（默认 4，可调 1-10）
   - **降级**：视频时长过短（<10s）或模型未返回时间戳时不抽帧，只在转写稿里保留文字
 - 归属：M4 实现清单（features.md #18）；依赖 M3 的视频本地下载（需本地文件才能 seek 抽帧）
+
+## ADR-017 干净分区：406 的真正根因与修复（2026-09-16，eeebcf4）
+
+- 用户判别测试：同网络 Chrome 访问小红书正常 → IP 未被封 → 406 针对我们请求的"身份"
+- 根因（引用 webview-ua-override 作者对 obsidian.asar 1.13.7 的反混淆 + 论坛帖 117394）：Obsidian 主进程对每个被 `create-browser-session` IPC 点名的分区装 `session.webRequest.onBeforeSendHeaders` 钩子，**删除 sec-fetch-dest / sec-ch-ua 头并改写 UA**——小红书对此类请求永久 406。解释了全部时间线：全新会话早期（钩子未装）拿到过 200，之后永久 406；Chrome 不受影响；裸 curl（同样缺浏览器头）也 406。sec-* 为浏览器禁止 JS 补的头，唯一解法=分区不被点名
+- 修复：①`initCleanPartition()` 包装 `ipcRenderer.send` 吞掉本分区的 create-browser-session（钩子永不安装；session 构造时执行）②恢复 useragent 属性（顺序：useragent→partition→attach→src；干净分区下属性真正生效）用本机 Chrome 153 版本号 ③干净分区无 session 级权限沙箱→元素级 permissionrequest 拒绝兜底 ④runSync 加即时 Notice（30 秒静默体验问题）
+- 已知代价（引用）：失去 Obsidian 对该分区的广告过滤（本就无此需求）；分区 cookie 不受影响（沿用 persist:rednote-sync，登录态保留）
+- 待真机验证：406 是否消失、同步全链路
