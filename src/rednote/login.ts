@@ -234,7 +234,11 @@ export class RedNoteLoginView extends ItemView {
 								` 目标${w}×${h}，请反馈此行`,
 						);
 					}
-					wv.setZoomFactor?.(0.8);
+					// Aggressive zoom: the guest viewport renders far smaller than
+				// the element in this Electron build; zooming the PAGE content
+				// (not the element) is the only lever that reliably makes the
+				// whole login dialog visible inside the small guest area.
+				wv.setZoomFactor?.(0.45);
 				}, 60);
 			}, 30);
 	}

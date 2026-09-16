@@ -51,35 +51,28 @@ export interface SyncResult {
 	newNoteIds: string[];
 }
 
-/** Ensure a vault folder (and parents) exists; return it. */
-async function ensureFolder(vault: Vault, folderPath: string): Promise<TFolder> {
+/** Ensure a vault folder (and parents) exists on DISK via the adapter.
+ *
+ * The vault-index APIs (createFolder/getAbstractFileByPath) desync from disk
+ * reality when folders are deleted externally (stale index entries make
+ * createFolder throw "already exists" while the folder is gone, and the
+ * reverse). adapter.mkdir is idempotent against the real filesystem and
+ * never throws on existing paths — Obsidian's file watcher picks up the
+ * directories for its index automatically. Returns the path (not a TFolder)
+ * so callers stop depending on the index entirely.
+ */
+async function ensureFolderPath(vault: Vault, folderPath: string): Promise<string> {
 	const clean = (folderPath ?? "").replace(/^\/+|\/+$/g, "");
 	if (clean === "") {
-		// Vault root: any file's parent is the root folder.
-		const anyFile = vault.getFiles()[0];
-		return (anyFile?.parent as TFolder) ?? (vault.getMarkdownFiles()[0]?.parent as TFolder);
+		return "/";
 	}
 	const parts = clean.split("/").filter((p) => p.length > 0);
-	let current: TFolder = (vault.getFiles()[0]?.parent as TFolder) ??
-		(vault.getMarkdownFiles()[0]?.parent as TFolder);
+	let current = "";
 	for (const part of parts) {
-		const childPath = current.path ? `${current.path}/${part}` : part;
-		let child = vault.getAbstractFileByPath(childPath);
-		// Disk truth beats the vault index: an externally deleted folder can
-		// linger in the index (then createFolder throws "already exists") or
-		// vice versa. Trust adapter.exists.
-		const existsOnDisk = await vault.adapter.exists(childPath);
-		if (!child || !existsOnDisk) {
-			try {
-				child = await vault.createFolder(childPath);
-			} catch {
-				child = vault.getAbstractFileByPath(childPath);
-				if (!child || !(await vault.adapter.exists(childPath))) {
-					throw new Error(`无法创建目录 ${childPath}`);
-				}
-			}
+		current = current ? `${current}/${part}` : part;
+		if (!(await vault.adapter.exists(current))) {
+			await vault.adapter.mkdir(current);
 		}
-		current = child as TFolder;
 	}
 	return current;
 }
@@ -117,12 +110,13 @@ export async function syncFavorites(
 		.toISOString()
 		.replace("Z", "+08:00");
 
-	// Resolve the target folder and collect existing .md names for collision handling.
-	const folder = await ensureFolder(vault, opts.notesFolder);
+	// Resolve the target folder path (adapter/disk-based, index-independent).
+	const folderPath = await ensureFolderPath(vault, opts.notesFolder);
+	const folderPrefix = folderPath === "/" ? "" : `${folderPath}/`;
 	const existing = new Set<string>(
 		vault
 			.getMarkdownFiles()
-			.filter((f) => (f.parent?.path ?? "") === folder.path)
+			.filter((f) => (f.parent?.path ?? "") === folderPath)
 			.map((f) => f.name),
 	);
 
@@ -159,12 +153,14 @@ export async function syncFavorites(
 				const record = toRecord(merged, syncedAt);
 				const name = resolveNoteFileName(record.title, record.note_id, existing);
 				const content = renderNoteMarkdown(record, opts.tagPrefix);
-				const filePath = folder.path ? `${folder.path}/${name}` : name;
-				const existingFile = vault.getAbstractFileByPath(filePath);
-				if (existingFile instanceof TFile) {
-					await vault.modify(existingFile, content);
-				} else {
-					await vault.create(filePath, content);
+				const filePath = `${folderPrefix}${name}`;
+				// Write via the adapter (disk truth): the vault-index APIs
+				// depend on the folder being indexed, which breaks on stale
+				// indexes (externally deleted folders). adapter.write works
+				// regardless; Obsidian's file watcher refreshes the index.
+				const existed = vault.getAbstractFileByPath(filePath) instanceof TFile;
+				await vault.adapter.write(filePath, content);
+				if (!existed) {
 					existing.add(name);
 				}
 				result.added += 1;

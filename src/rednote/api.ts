@@ -621,10 +621,6 @@ export class RedNoteSession {
 					this.log(
 						`getCookieString：分区取得 ${cookies.length} 个 cookie，web_session=${names.includes("web_session") ? "有" : "无"}，a1=${names.includes("a1") ? "有" : "无"}`,
 					);
-					// TEMPORARY diagnostic dump (removed after the egress
-					// experiment): lets the parent run a standalone Node probe
-					// with the exact session cookies. debug.log is local-only.
-					this.log(`COOKIE_DUMP:${joinCookies(cookies.map((c) => ({ name: String(c.name), value: String(c.value) })))}`);
 					return joinCookies(
 						cookies.map((c) => ({ name: String(c.name), value: String(c.value) })),
 					);
