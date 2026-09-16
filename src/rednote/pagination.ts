@@ -3,7 +3,7 @@
 // inside `data`: { notes: [...], has_more: boolean, cursor: string }.
 // We mirror that shape here so it can be unit-tested without a webview.
 
-import type { RedNotePage, RedNoteRaw } from "./types";
+import type { RedNoteBoard, RedNotePage, RedNoteRaw } from "./types";
 
 /** A single note item in a raw XHS list page. */
 export interface RawListItem {
@@ -110,4 +110,108 @@ export function parseListPage(data: RawListData | null | undefined): RedNotePage
  */
 export function shouldContinue(page: RedNotePage): boolean {
 	return page.has_more && page.next_cursor.length > 0;
+}
+
+// ---------------------------------------------------------------------------
+// M3.1: board (收藏夹) endpoints.
+// ---------------------------------------------------------------------------
+
+/** Candidate keys for a board's id / display name (observed payloads vary). */
+const BOARD_ID_KEYS = ["board_id", "id"];
+const BOARD_NAME_KEYS = ["board_name", "name", "title"];
+
+/** First non-empty string value among `keys` on `obj` ("" when none). */
+function firstNonEmptyString(obj: Record<string, unknown>, keys: string[]): string {
+	for (const k of keys) {
+		const v = obj[k];
+		if (typeof v === "string" && v.length > 0) {
+			return v;
+		}
+	}
+	return "";
+}
+
+/**
+ * Parse the `data` block of GET /api/sns/web/v1/board/user into board
+ * descriptors. Tolerant by contract: the response shape of the board
+ * endpoints is the least-verified part of this pipeline, so a missing /
+ * malformed `boards` array yields [] (caller falls back to the flat collect
+ * list) and entries without any id candidate are skipped. The raw object is
+ * preserved on every parsed board (diagnostics: fetchUserBoards logs it).
+ */
+export function parseBoardList(data: unknown): RedNoteBoard[] {
+	const boardsRaw =
+		data != null &&
+		typeof data === "object" &&
+		Array.isArray((data as Record<string, unknown>).boards)
+			? ((data as Record<string, unknown>).boards as unknown[])
+			: [];
+	const boards: RedNoteBoard[] = [];
+	for (const entry of boardsRaw) {
+		if (!entry || typeof entry !== "object") {
+			continue;
+		}
+		const o = entry as Record<string, unknown>;
+		const board_id = firstNonEmptyString(o, BOARD_ID_KEYS);
+		if (!board_id) {
+			continue;
+		}
+		boards.push({ board_id, name: firstNonEmptyString(o, BOARD_NAME_KEYS), raw: o });
+	}
+	return boards;
+}
+
+/**
+ * Count repeated note_ids WITHIN one raw list page (the same batch of cards
+ * can appear twice on a single page). parseListPage silently removes these;
+ * this keeps the removed count for the per-page diagnostic log. Non-string /
+ * empty note_ids are ignored (mirrors parseListPage's drop rule).
+ */
+export function countRawDuplicates(items: unknown): number {
+	if (!Array.isArray(items)) {
+		return 0;
+	}
+	const seen = new Set<string>();
+	let duplicates = 0;
+	for (const it of items) {
+		const id =
+			it && typeof it === "object" ? (it as Record<string, unknown>).note_id : undefined;
+		if (typeof id !== "string" || id.length === 0) {
+			continue;
+		}
+		if (seen.has(id)) {
+			duplicates += 1;
+		} else {
+			seen.add(id);
+		}
+	}
+	return duplicates;
+}
+
+/**
+ * First-come-first-served cross-page dedupe for one sync run: partition the
+ * page's cards into fresh (first encounter — the caller processes them and
+ * records the encounter's context, e.g. the board name) and duplicates
+ * (already claimed earlier in the same run — skipped WITHOUT any request).
+ * Cards without a note_id are dropped on the floor (never claimable).
+ * `seen` is mutated (the run-scoped memory Set).
+ */
+export function splitSeen(
+	items: RedNoteRaw[],
+	seen: Set<string>,
+): { fresh: RedNoteRaw[]; duplicates: number } {
+	const fresh: RedNoteRaw[] = [];
+	let duplicates = 0;
+	for (const item of items) {
+		if (!item.note_id) {
+			continue;
+		}
+		if (seen.has(item.note_id)) {
+			duplicates += 1;
+			continue;
+		}
+		seen.add(item.note_id);
+		fresh.push(item);
+	}
+	return { fresh, duplicates };
 }

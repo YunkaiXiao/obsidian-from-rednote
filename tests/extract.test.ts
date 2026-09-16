@@ -122,4 +122,21 @@ describe("toRecord", () => {
 	it("uses a default +08:00 offset for created_at", () => {
 		expect(XHS_UTC_OFFSET_MIN).toBe(480);
 	});
+
+	it("injects the board name as collection (M3.1 boards path)", () => {
+		const rec = toRecord(
+			{ note_id: "n1", type: "image", title: "t" },
+			"2026-09-17T10:00:00+08:00",
+			"摄影·旅行",
+		);
+		expect(rec.collection).toBe("摄影·旅行");
+		// Everything else is unaffected by the third argument.
+		expect(rec.note_id).toBe("n1");
+		expect(rec.collected_at).toBe("");
+	});
+
+	it("defaults collection to \"\" when the caller omits it (flat fallback)", () => {
+		const rec = toRecord({ note_id: "n2", type: "video" }, "2026-09-17T10:00:00+08:00");
+		expect(rec.collection).toBe("");
+	});
 });

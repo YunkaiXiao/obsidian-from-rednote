@@ -139,14 +139,22 @@ export function mergeNoteCard(
  * Build a render-ready RedNoteRecord from a merged raw note.
  *
  * Honesty about "not obtainable" fields:
- *  - `collected_at` and `collection` are NOT returned by the flat
- *    /note/collect/page list endpoint we use, so they are left "" and the
- *    renderer annotates them. `synced_at` is set by the caller at sync time.
+ *  - `collected_at` is NOT returned by the list endpoints we use, so it is
+ *    left "" and the renderer annotates it. `synced_at` is set by the caller
+ *    at sync time.
+ *  - `collection` (M3.1): the sync layer supplies the 收藏夹 name for cards
+ *    fetched via a board (收藏夹); the flat /note/collect/page fallback
+ *    cannot know a collection, so it stays "" there.
  *
  * @param merged     Merged raw note (card + detail).
  * @param syncedAt   ISO 8601 sync time (caller-supplied, with offset).
+ * @param collection Board (收藏夹) name when the card came from a board; "" otherwise.
  */
-export function toRecord(merged: RedNoteRaw, syncedAt: string): RedNoteRecord {
+export function toRecord(
+	merged: RedNoteRaw,
+	syncedAt: string,
+	collection = "",
+): RedNoteRecord {
 	return {
 		note_id: merged.note_id,
 		type: merged.type ?? "image",
@@ -161,7 +169,7 @@ export function toRecord(merged: RedNoteRaw, syncedAt: string): RedNoteRecord {
 		video_url: merged.video_url ?? "",
 		created_at: epochToIso(merged.time_ms ?? 0, XHS_UTC_OFFSET_MIN),
 		collected_at: "", // not obtainable from the collect list endpoint
-		collection: "", // not obtainable from the collect list endpoint
+		collection: collection ?? "", // board name (M3.1 boards); "" on the flat fallback
 		synced_at: syncedAt,
 	};
 }

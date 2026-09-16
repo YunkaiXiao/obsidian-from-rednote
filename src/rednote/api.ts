@@ -28,10 +28,18 @@ import { requestUrl } from "obsidian";
 import {
 	NotLoggedInError,
 	SignError,
+	type RedNoteBoard,
+	type RedNotePage,
 	type RedNoteRaw,
 	type RedNoteSign,
 } from "./types";
-import { parseListPage, shouldContinue, type RawListData } from "./pagination";
+import {
+	countRawDuplicates,
+	parseBoardList,
+	parseListPage,
+	shouldContinue,
+	type RawListData,
+} from "./pagination";
 import { mergeNoteCard } from "./extract";
 // xhsSignXyw = CURRENT XYW_ (AES-128-CBC) X-S format. The legacy XYS_ variant
 // (xhsSign) stays in sign.ts as a backup path — since ~2026-03 data-fetching
@@ -39,12 +47,14 @@ import { mergeNoteCard } from "./extract";
 import { xhsSign, xhsSignXyw, generateB1 } from "./sign";
 import { signRequest } from "./sign-ref";
 import {
+	buildBoardNoteParams,
 	buildCollectPageParams,
 	buildGetQueryString,
 	extractCookieValue,
 	isXhsHost,
 	joinCookies,
 	newXrayTraceid,
+	BOARD_NOTE_NUM,
 	EDGE_UA as WIRE_EDGE_UA,
 } from "./wire";
 
@@ -1690,17 +1700,60 @@ export class RedNoteSession {
 	 * num -> user_id -> image_formats=jpg,webp,avif (commas literal). The
 	 * same ordered object feeds both the signed content string and the URL.
 	 */
+	/**
+	 * `rawDuplicates` = repeated note_ids WITHIN this raw page. parseListPage
+	 * removes them silently; the count is kept for the per-page diagnostic
+	 * log (they are invisible in `page.items` by construction).
+	 */
 	async fetchFavoritesPage(
 		userId: string,
 		cursor: string,
-	): Promise<{ items: RedNoteRaw[]; has_more: boolean; next_cursor: string }> {
+	): Promise<{ page: RedNotePage; rawDuplicates: number }> {
 		const data = (await this.request(
 			"GET",
 			"/api/sns/web/v2/note/collect/page",
 			buildCollectPageParams(userId, cursor),
 		)) as unknown as RawListData;
-		const page = parseListPage(data);
-		return page;
+		return { page: parseListPage(data), rawDuplicates: countRawDuplicates(data?.notes) };
+	}
+
+	/**
+	 * Fetch the user's 收藏夹 (boards) list.
+	 * Endpoint (deobfuscation-confirmed): GET /api/sns/web/v1/board/user
+	 *   ?user_id=…  ->  data.boards[]
+	 * The response shape of the board endpoints is the least-verified part of
+	 * this pipeline, so the RAW data block is logged ONCE per call (truncated)
+	 * and parsing is tolerant (see parseBoardList): the name field key varies
+	 * across payloads (board_name / name / title).
+	 */
+	async fetchUserBoards(userId: string): Promise<RedNoteBoard[]> {
+		const data = await this.request("GET", "/api/sns/web/v1/board/user", {
+			user_id: userId,
+		});
+		this.log(
+			`board/user 原始返回（截断）：${JSON.stringify(data ?? null).slice(0, 1500)}`,
+		);
+		return parseBoardList(data);
+	}
+
+	/**
+	 * Fetch one page of a board's notes.
+	 * Endpoint (deobfuscation-confirmed): GET /api/sns/web/v1/board/note
+	 *   ?board_id=…&cursor=…&num=…  ->  data.notes[] + has_more + cursor
+	 * The cards have the same structure as collect/page's, so the identical
+	 * parse (parseListPage) applies; `rawDuplicates` mirrors fetchFavoritesPage.
+	 */
+	async fetchBoardNotes(
+		boardId: string,
+		cursor: string,
+		num: number = BOARD_NOTE_NUM,
+	): Promise<{ page: RedNotePage; rawDuplicates: number }> {
+		const data = (await this.request(
+			"GET",
+			"/api/sns/web/v1/board/note",
+			buildBoardNoteParams(boardId, cursor, num),
+		)) as unknown as RawListData;
+		return { page: parseListPage(data), rawDuplicates: countRawDuplicates(data?.notes) };
 	}
 
 	/**

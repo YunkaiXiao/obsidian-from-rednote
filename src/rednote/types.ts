@@ -78,6 +78,21 @@ export interface RedNoteRecord {
 	synced_at: string;
 }
 
+/**
+ * One 收藏夹 (board) from /api/sns/web/v1/board/user, tolerantly normalized:
+ * the id/name field keys vary across observed payloads (board_name / name /
+ * title), so extraction tries the known candidates and the untouched raw
+ * object is kept for diagnostics / future fields.
+ */
+export interface RedNoteBoard {
+	/** Board id (first non-empty of board_id / id). */
+	board_id: string;
+	/** Display name (first non-empty of board_name / name / title). */
+	name: string;
+	/** The raw board object as returned by the API (never mutated). */
+	raw: Record<string, unknown>;
+}
+
 /** Result of parsing a paginated XHS list response. */
 export interface RedNotePage {
 	/** Raw note items on this page (lightweight cards). */

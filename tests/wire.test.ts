@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+	buildBoardNoteParams,
 	buildCollectPageParams,
 	buildGetQueryString,
 	joinCookies,
@@ -28,6 +29,32 @@ describe("buildCollectPageParams (query order per reference sign-manager)", () =
 	it("omits cursor on the first page (cursor=\"\" -> param absent)", () => {
 		const p = buildCollectPageParams("u1", "");
 		expect(Object.keys(p)).toEqual(["num", "user_id", "image_formats", "xsec_token", "xsec_source"]);
+	});
+});
+
+describe("buildBoardNoteParams (M3.1 board/note: board_id -> cursor -> num)", () => {
+	it("orders board_id -> cursor -> num on paged requests", () => {
+		const p = buildBoardNoteParams("65f2a8b3000000001234", "c1");
+		expect(Object.keys(p)).toEqual(["board_id", "cursor", "num"]);
+		expect(p["board_id"]).toBe("65f2a8b3000000001234");
+		expect(p["cursor"]).toBe("c1");
+		expect(p["num"]).toBe("30");
+	});
+
+	it("omits cursor on the first page and defaults num to 30", () => {
+		const p = buildBoardNoteParams("b1", "");
+		expect(Object.keys(p)).toEqual(["board_id", "num"]);
+		expect(p["num"]).toBe("30");
+	});
+
+	it("honors an explicit page size", () => {
+		expect(buildBoardNoteParams("b1", "c", 50)["num"]).toBe("50");
+	});
+
+	it("serializes to the exact query the signature is computed over", () => {
+		expect(buildGetQueryString(buildBoardNoteParams("b/1", "c=2"))).toBe(
+			"board_id=b%2F1&cursor=c%3D2&num=30",
+		);
 	});
 });
 

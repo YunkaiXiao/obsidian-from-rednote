@@ -12,6 +12,9 @@ import { xhsQueryEscape } from "./sign";
 /** `num` parameter of the favorites (collect) list endpoint. */
 export const COLLECT_PAGE_NUM = 30;
 
+/** `num` parameter of the board (收藏夹) note-list endpoint (M3.1). */
+export const BOARD_NOTE_NUM = 30;
+
 /**
  * UA for plugin-process data requests AND CDN media downloads — the reference
  * implementation's Edge 142 UA, copied verbatim. Defined here (pure module)
@@ -48,6 +51,29 @@ export function buildCollectPageParams(userId: string, cursor: string): Record<s
 	params.image_formats = COLLECT_IMAGE_FORMATS;
 	params.xsec_token = "";
 	params.xsec_source = "";
+	return params;
+}
+
+/**
+ * Ordered GET params for /api/sns/web/v1/board/note (M3.1, deobfuscation-
+ * confirmed path/query shape: board_id=…&cursor=…&num=…): board_id -> optional
+ * cursor -> num. The same ordered object feeds both the signed content string
+ * and the URL, so the server reconstructs exactly the string that was signed.
+ *
+ * @param boardId the 收藏夹's board_id
+ * @param cursor  pagination cursor ("" on the first page -> param omitted)
+ * @param num     page size (default 30)
+ */
+export function buildBoardNoteParams(
+	boardId: string,
+	cursor: string,
+	num: number = BOARD_NOTE_NUM,
+): Record<string, string> {
+	const params: Record<string, string> = { board_id: boardId };
+	if (cursor) {
+		params.cursor = cursor;
+	}
+	params.num = String(num);
 	return params;
 }
 
