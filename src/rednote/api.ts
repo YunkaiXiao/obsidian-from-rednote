@@ -580,8 +580,13 @@ export class RedNoteSession {
 	): Promise<Record<string, unknown>> {
 		const headers: Record<string, string> = {
 			accept: "application/json, text/plain, */*",
-			"content-type": "application/json;charset=UTF-8",
 		};
+		// content-type ONLY on POST with a body — a bodyless GET carrying a
+		// JSON content-type is unnatural (the page's own GETs don't) and is a
+		// prime 406 discriminator between our requests and the page's.
+		if (method === "POST") {
+			headers["content-type"] = "application/json;charset=UTF-8";
+		}
 		// Signing requires a page-context function (window._webmsxyw & al.) that
 		// is not guaranteed to exist at any given moment. Callers that do NOT
 		// need signatures (selfinfo responds to cookies alone — MediaCrawler's
@@ -735,6 +740,16 @@ export class RedNoteSession {
 			try {
 				const ox = XMLHttpRequest.prototype.open;
 				const os = XMLHttpRequest.prototype.send;
+				const osh = XMLHttpRequest.prototype.setRequestHeader;
+				XMLHttpRequest.prototype.setRequestHeader = function (n, v) {
+					try {
+						if (this.__pullUrl && this.__pullUrl.indexOf("edith.xiaohongshu.com") >= 0) {
+							if (!window.__pullHdrs) { window.__pullHdrs = {}; }
+							if (!(n in window.__pullHdrs)) { window.__pullHdrs[n] = String(v).slice(0, 18); }
+						}
+					} catch (err) {}
+					return osh.apply(this, arguments);
+				};
 				XMLHttpRequest.prototype.open = function (mth, url) {
 					try { this.__pullUrl = String(url); } catch (err) {}
 					return ox.apply(this, arguments);
@@ -767,7 +782,7 @@ export class RedNoteSession {
 		// GUEST_VIEW_MANAGER_CALL error. Every access is wrapped so the eval
 		// always resolves with a JSON summary.
 		const code = `(() => {
-			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent", pageReqs: "" };
+			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent", pageReqs: "", pageHdrs: "" };
 			// Page-request recorder: hook fetch ONCE and remember the status of
 			// every edith API call the PAGE ITSELF makes. If the page's own
 			// requests also get 406, the block is webview-session-wide (device/
@@ -792,6 +807,10 @@ export class RedNoteSession {
 				out.pageReqs = (window.__pullReqs || []).slice(-6)
 					.map(function (e) { return (e.s || "?") + "<" + e.u.slice(28, 62) + ">"; })
 					.join(" ; ");
+				out.pageHdrs = Object.keys(window.__pullHdrs || {})
+					.map(function (k) { return k + "=" + window.__pullHdrs[k]; })
+					.join(" , ")
+					.slice(0, 200);
 			} catch (e) { out.pageReqs = "HOOK_ERR"; }
 			try { out.cookieA1 = /(?:^|; )a1=/.test(document.cookie); } catch (e) {}
 			try {
@@ -825,12 +844,16 @@ export class RedNoteSession {
 						stateKeys?: string;
 						loggedIn?: string;
 						pageReqs?: string;
+						pageHdrs?: string;
 					})
 				: null;
 			if (!p) {
 				return { ok: false, info: "页面探测无返回" };
 			}
 			const stateKeys = (p.stateKeys ?? "").slice(0, 80);
+			if (p.pageHdrs) {
+				this.log(`页面成功请求的头样例：${p.pageHdrs}`);
+			}
 			this.log(`页面自身请求记录：${p.pageReqs || "（暂无）"}`);
 			const info =
 				`页面侧 loggedIn=${p.loggedIn ?? "?"}，INITIAL_STATE.user=${p.userKeys || "无"}` +
