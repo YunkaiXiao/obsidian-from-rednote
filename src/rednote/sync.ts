@@ -65,15 +65,16 @@ async function ensureFolder(vault: Vault, folderPath: string): Promise<TFolder> 
 	for (const part of parts) {
 		const childPath = current.path ? `${current.path}/${part}` : part;
 		let child = vault.getAbstractFileByPath(childPath);
-		if (!child) {
+		// Disk truth beats the vault index: an externally deleted folder can
+		// linger in the index (then createFolder throws "already exists") or
+		// vice versa. Trust adapter.exists.
+		const existsOnDisk = await vault.adapter.exists(childPath);
+		if (!child || !existsOnDisk) {
 			try {
 				child = await vault.createFolder(childPath);
 			} catch {
-				// Tolerate races with the vault index (e.g. the folder was just
-				// created or deleted externally): re-read, then fail only if it
-				// truly does not exist as a folder.
 				child = vault.getAbstractFileByPath(childPath);
-				if (!child) {
+				if (!child || !(await vault.adapter.exists(childPath))) {
 					throw new Error(`无法创建目录 ${childPath}`);
 				}
 			}
