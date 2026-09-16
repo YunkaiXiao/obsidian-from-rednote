@@ -168,3 +168,10 @@
 
 - 用户反馈：通过 ZCode 客户端触发处理有 token 优惠——**视频的 AI 处理完全由 ZCode 轨道承担**（在线链接 + 临时目录方式），插件轨道①不再对视频调用外部 API（图片分析仍可插件即时处理）
 - aiExecutor 语义微调：video 转写与关键帧固定走 ZCode 协议；plugin 执行器仅处理图片
+
+## ADR-019 请求管线重造：Node 侧 requestUrl + 分区 Cookie + x-rap-param（2026-09-16，b71281d）
+
+- 依据：对 ytf606/xhs2obsidian（已验证可用的同型插件）的源码级研究——它从插件进程用 Obsidian requestUrl 发请求（非页面上下文），本地 XYS_ 签名（xhshow 血统，与本项目同源），**截获并附带 webview 中小红书自家 XHR 的 x-rap-param 头**（Headers/fetch/XHR 三处 monkey-patch + homefeed warmup 诱产），Cookie 用 electron remote session.fromPartition 提取（含 HttpOnly），登录验证走无签名 v2/user/me
+- 实施：新增 src/rednote/wire.ts（纯模块：query 有序拼接 cursor→num→user_id→image_formats、cookie 串、x-xray-traceid 时间戳位移格式）；api.ts 的 request() 重造为 nodeRequest 薄委托（页面 fetch 路径移除）；checkLogin API 通道改 v2/user/me；collect/page query 顺序对齐参考；101/101 单测（+12 wire）
+- 两大真机未知数（下轮验证焦点）：x-rap-param 截获成功率；electron.remote.session 在 Obsidian renderer 的可用性（降级 document.cookie 会缺 HttpOnly）
+- 修正：ADR-007 描述的"取数在 webview 内执行"旧通路自此作废
