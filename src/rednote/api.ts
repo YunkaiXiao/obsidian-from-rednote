@@ -659,6 +659,41 @@ export class RedNoteSession {
 	private rapParamCache: string | null = null;
 
 	/**
+	 * Run a request INSIDE the webview page via XHR — the page's own
+	 * Chromium network stack with its cookies and fingerprint, plus our
+	 * signature and mirrored headers. The page's organic requests are the
+	 * only ones the server never 406s, so this is the last-resort transport.
+	 */
+	async pageContextXhr(
+		fullUrl: string,
+		method: string,
+		headers: Record<string, string>,
+		body?: string,
+	): Promise<{ status: number; text: string }> {
+		const code = `(() => new Promise((resolveP) => {
+			try {
+				const xhr = new XMLHttpRequest();
+				xhr.open(${JSON.stringify(method)}, ${JSON.stringify(fullUrl)}, true);
+				xhr.withCredentials = true;
+				const hs = ${JSON.stringify(headers)};
+				for (const k of Object.keys(hs)) { try { xhr.setRequestHeader(k, hs[k]); } catch (eS) {} }
+				xhr.timeout = 15000;
+				xhr.onload = function () { resolveP(JSON.stringify({ status: xhr.status, text: String(xhr.responseText || "").slice(0, 200000) })); };
+				xhr.onerror = function () { resolveP(JSON.stringify({ status: -1, text: "xhr onerror" })); };
+				xhr.ontimeout = function () { resolveP(JSON.stringify({ status: -2, text: "xhr timeout" })); };
+				xhr.send(${body ? JSON.stringify(body) : "null"});
+			} catch (eX) { resolveP(JSON.stringify({ status: -3, text: "xhr throw:" + String(eX).slice(0, 80) })); }
+		}))()`;
+		try {
+			const raw = await this.eval<string>(code);
+			const p = raw ? (JSON.parse(raw) as { status?: number; text?: string }) : null;
+			return { status: p?.status ?? -1, text: p?.text ?? "" };
+		} catch (e) {
+			return { status: -1, text: `eval 失败：${e instanceof Error ? e.message.slice(0, 80) : String(e)}` };
+		}
+	}
+
+	/**
 	 * Full header map captured from the PAGE'S OWN successful edith requests
 	 * (Service-Tag, c_device_id, …). Used to mirror the page's header set on
 	 * our outbound requests — the server 406s requests missing these.
@@ -675,7 +710,11 @@ export class RedNoteSession {
 			// yet) still mirror the page's header set.
 			if (Object.keys(live).length >= 3 && this.pageHeaderStore) {
 				try {
-					this.pageHeaderStore.set(live);
+					// MERGE, never replace: different endpoints carry different
+					// headers (unread_count shows the boring 7; homefeed adds
+					// Service-Tag / c_device_id) — accumulate every name ever
+					// seen so the mirror gets the full set.
+					this.pageHeaderStore.set({ ...this.pageHeaderStore.get(), ...live });
 				} catch {
 					/* persistence is best-effort */
 				}
@@ -1010,8 +1049,28 @@ export class RedNoteSession {
 					r = c;
 				} else {
 					this.log(
-						`${reqTag} -> curl 兜底仍 ${c.status}（服务端头：${c.serverHeaders}）`,
+						`${reqTag} -> curl 兜底仍 ${c.status}（服务端头：${c.serverHeaders}），尝试页面上下文 XHR`,
 					);
+					// FINAL FALLBACK: run the request INSIDE the webview page
+					// via XHR — the page's own Chromium stack (the same one
+					// whose organic requests consistently get 200) with our
+					// signature + mirrored headers; cookies/UA are provided by
+					// the page context itself.
+					const skipInPage = new Set([
+						"cookie", "host", "content-length", "connection",
+						"accept-encoding", "origin", "referer", "user-agent",
+					]);
+					const pageHeaders: Record<string, string> = {};
+					for (const [k, v] of Object.entries(headers)) {
+						if (!skipInPage.has(k.toLowerCase())) {
+							pageHeaders[k] = v;
+						}
+					}
+					const p = await this.pageContextXhr(fullUrl, method, pageHeaders, body);
+					if (p.status > 0) {
+						this.log(`${reqTag} -> 页面 XHR HTTP ${p.status}`);
+						r = p;
+					}
 				}
 			}
 			let json: Record<string, unknown> | null = null;
@@ -1210,12 +1269,17 @@ export class RedNoteSession {
 			} catch (errW) {}
 			return "installed";
 		})()`;
-		try {
-			await this.eval<string>(code);
-		} catch {
-			/* recorder / interceptor is best-effort diagnostics */
+			try {
+				const res = await this.eval<string>(code);
+				this.log(
+					`installPageRecorder：${res === "already" ? "已存在" : "新装"}（warmup ${res === "already" ? "跳过" : "已触发"}）`,
+				);
+			} catch (e) {
+				this.log(
+					`installPageRecorder eval 失败：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
+				);
+			}
 		}
-	}
 
 	async checkLoginViaPage(): Promise<{ ok: boolean; info: string }> {
 		// Fully defensive: XHS pages can make window.__INITIAL_STATE__ access
