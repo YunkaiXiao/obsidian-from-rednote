@@ -47,7 +47,7 @@ import {
 } from "./wire";
 
 /** The partition isolates this session from Obsidian's default browser session. */
-const WEBVIEW_PARTITION = "persist:rednote-sync";
+const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — the v1 partition's a1 got server-flagged after 2 days of debug traffic
 /**
  * Chrome UA matching the user's real local Chrome build. With the clean-
  * partition IPC swallow (see initCleanPartition) this attribute WORKS: the
