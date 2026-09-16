@@ -175,3 +175,11 @@
 - 实施：新增 src/rednote/wire.ts（纯模块：query 有序拼接 cursor→num→user_id→image_formats、cookie 串、x-xray-traceid 时间戳位移格式）；api.ts 的 request() 重造为 nodeRequest 薄委托（页面 fetch 路径移除）；checkLogin API 通道改 v2/user/me；collect/page query 顺序对齐参考；101/101 单测（+12 wire）
 - 两大真机未知数（下轮验证焦点）：x-rap-param 截获成功率；electron.remote.session 在 Obsidian renderer 的可用性（降级 document.cookie 会缺 HttpOnly）
 - 修正：ADR-007 描述的"取数在 webview 内执行"旧通路自此作废
+
+## ADR-020 406 终局：window.mnsv2 页面原生签名 + M2 毕业（2026-09-17，32999dd/02acfec）
+
+- **胜利路径**：用户 vault 中装有原版商业插件 rednote2obsidian（7 月成功同步过 103 篇、cookie 今天仍活跃）→ 解其混淆字符串表（1376 条）→ 发现其在 webview 中调用 **`window.mnsv2(f, md5(f), md5(apiUrl))`**——小红书页面自带的签名入口，配 SDK 4.3.3/s0:3 信封 + 页面实时 a1/b1 + 无 charset 的 Content-Type + 不发 x-xray-traceid
+- 本插件实现 `signViaPageMnsv2()`（在自己登录 webview 的页面上下文执行同款协议，本地移植签名降级为兜底）；真机验证：**collect/page 通过、5 篇收藏成功落盘**，frontmatter 完全符合 ADR-006 模板
+- 教训链（为何本地签名全败）：XYS_/XYW_ 本地算法产出的签名在严格端点（collect/page）全部被拒——无论血统（xhshow/redbook）、传输（requestUrl/Node https/curl/页面 XHR）、身份（v1/v2 分区、商业插件 cookie）如何组合；页面原生 mnsv2 签名是唯一被接受的路径（user/me 等宽松端点除外）
+- 同批修复（02acfec）：目录/文件写入全面改用 adapter API（磁盘真值，索引不同步不再报错，目录存在直接同步）；登录页 0.45 深度缩放（矮 guest 视口内显示完整二维码）；移除 COOKIE_DUMP 临时诊断
+- **M2 毕业条件全部达成**：登录 ✓ 检测 ✓ 会话保持 ✓ 取数（mnsv2 签名）✓ 渲染 ✓ 落盘 ✓ 增量去重 ✓ 限速 ✓
