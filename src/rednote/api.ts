@@ -772,6 +772,120 @@ export class RedNoteSession {
 	 * accepts, unlike our previous xhshow-derived signer (perpetual 406).
 	 * It takes the FULL cookie string and synthesizes its own fingerprint b1.
 	 */
+	/**
+	 * GENUINE page signature: executes, inside our logged-in webview, the
+	 * signing protocol the XHS page itself exposes — window.mnsv2(f, md5(f),
+	 * md5(apiUrl)) — wrapped in the SDK 4.3.3 / s0:3 envelope with the
+	 * page's live a1 cookie and localStorage b1. This is the same call the
+	 * working commercial plugin makes from its webview (behavior extracted
+	 * from its bundled script on this machine); signatures produced this way
+	 * are accepted where every locally-computed variant is 406'd.
+	 */
+	async signViaPageMnsv2(
+		apiUrl: string,
+		apiData: Record<string, unknown> | null,
+	): Promise<Record<string, string> | null> {
+		const code = `(() => {
+			try {
+				var apiUrl = ${JSON.stringify(apiUrl)};
+				var apiData = ${JSON.stringify(apiData ?? null)};
+				var timestamp = Date.now();
+				var f = apiUrl;
+				if (apiData !== null && apiData !== undefined) {
+					var toStr = Object.prototype.toString;
+					if (toStr.call(apiData) === "[object Object]" || toStr.call(apiData) === "[object Array]") { f += JSON.stringify(apiData); }
+					else if (typeof apiData === "string") { f += apiData; }
+				}
+				function md5(string) {
+					function md5cycle(x, k) {
+						var a = x[0], b = x[1], c = x[2], d = x[3];
+						a = ff(a, b, c, d, k[0], 7, -680876936); d = ff(d, a, b, c, k[1], 12, -389564586);
+						c = ff(c, d, a, b, k[2], 17, 606105819); b = ff(b, c, d, a, k[3], 22, -1044525330);
+						a = ff(a, b, c, d, k[4], 7, -176418897); d = ff(d, a, b, c, k[5], 12, 1200080426);
+						c = ff(c, d, a, b, k[6], 17, -1473231341); b = ff(b, c, d, a, k[7], 22, -45705983);
+						a = ff(a, b, c, d, k[8], 7, 1770035416); d = ff(d, a, b, c, k[9], 12, -1958414417);
+						c = ff(c, d, a, b, k[10], 17, -42063); b = ff(b, c, d, a, k[11], 22, -1990404162);
+						a = ff(a, b, c, d, k[12], 7, 1804603682); d = ff(d, a, b, c, k[13], 12, -40341101);
+						c = ff(c, d, a, b, k[14], 17, -1502002290); b = ff(b, c, d, a, k[15], 22, 1236535329);
+						a = gg(a, b, c, d, k[1], 5, -165796510); d = gg(d, a, b, c, k[6], 9, -1069501632);
+						c = gg(c, d, a, b, k[11], 14, 643717713); b = gg(b, c, d, a, k[0], 20, -373897302);
+						a = gg(a, b, c, d, k[5], 5, -701558691); d = gg(d, a, b, c, k[10], 9, 38016083);
+						c = gg(c, d, a, b, k[15], 14, -660478335); b = gg(b, c, d, a, k[4], 20, -405537848);
+						a = gg(a, b, c, d, k[9], 5, 568446438); d = gg(d, a, b, c, k[14], 9, -1019803690);
+						c = gg(c, d, a, b, k[3], 14, -187363961); b = gg(b, c, d, a, k[8], 20, 1163531501);
+						a = gg(a, b, c, d, k[13], 5, -1444681467); d = gg(d, a, b, c, k[2], 9, -51403784);
+						c = gg(c, d, a, b, k[7], 14, 1735328473); b = gg(b, c, d, a, k[12], 20, -1926607734);
+						a = hh(a, b, c, d, k[5], 4, -378558); d = hh(d, a, b, c, k[8], 11, -2022574463);
+						c = hh(c, d, a, b, k[11], 16, 1839030562); b = hh(b, c, d, a, k[14], 23, -35309556);
+						a = hh(a, b, c, d, k[1], 4, -1530992060); d = hh(d, a, b, c, k[4], 11, 1272893353);
+						c = hh(c, d, a, b, k[7], 16, -155497632); b = hh(b, c, d, a, k[10], 23, -1094730640);
+						a = hh(a, b, c, d, k[13], 4, 681279174); d = hh(d, a, b, c, k[0], 11, -358537222);
+						c = hh(c, d, a, b, k[3], 16, -722521979); b = hh(b, c, d, a, k[6], 23, 76029189);
+						a = hh(a, b, c, d, k[9], 4, -640364487); d = hh(d, a, b, c, k[12], 11, -421815835);
+						c = hh(c, d, a, b, k[15], 16, 530742520); b = hh(b, c, d, a, k[2], 23, -995338651);
+						a = ii(a, b, c, d, k[0], 6, -198630844); d = ii(d, a, b, c, k[7], 10, 1126891415);
+						c = ii(c, d, a, b, k[14], 15, -1416354905); b = ii(b, c, d, a, k[5], 21, -57434055);
+						a = ii(a, b, c, d, k[12], 6, 1700485571); d = ii(d, a, b, c, k[3], 10, -1894986606);
+						c = ii(c, d, a, b, k[10], 15, -1051523); b = ii(b, c, d, a, k[1], 21, -2054922799);
+						a = ii(a, b, c, d, k[8], 6, 1873313359); d = ii(d, a, b, c, k[15], 10, -30611744);
+						c = ii(c, d, a, b, k[6], 15, -1560198380); b = ii(b, c, d, a, k[13], 21, 1309151649);
+						a = ii(a, b, c, d, k[4], 6, -145523070); d = ii(d, a, b, c, k[11], 10, -1120210379);
+						c = ii(c, d, a, b, k[2], 15, 718787259); b = ii(b, c, d, a, k[9], 21, -343485551);
+						x[0] = add32(a, x[0]); x[1] = add32(b, x[1]); x[2] = add32(c, x[2]); x[3] = add32(d, x[3]);
+					}
+					function cmn(q, a, b, x, s, t) { a = add32(add32(a, q), add32(x, t)); return add32((a << s) | (a >>> (32 - s)), b); }
+					function ff(a, b, c, d, x, s, t) { return cmn((b & c) | ((~b) & d), a, b, x, s, t); }
+					function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & (~d)), a, b, x, s, t); }
+					function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+					function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | (~d)), a, b, x, s, t); }
+					function md5blk(s) { var md5blks = []; for (var i = 0; i < 64; i += 4) md5blks[i >> 2] = s.charCodeAt(i) + (s.charCodeAt(i+1) << 8) + (s.charCodeAt(i+2) << 16) + (s.charCodeAt(i+3) << 24); return md5blks; }
+					function md51(s) { var n = s.length; var state = [1732584193, -271733879, -1732584194, 271733878]; var i; for (i = 64; i <= n; i += 64) md5cycle(state, md5blk(s.substring(i - 64, i))); s = s.substring(i - 64); var tail = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]; for (i = 0; i < s.length; i++) tail[i >> 2] |= s.charCodeAt(i) << ((i % 4) << 3); tail[i >> 2] |= 0x80 << ((i % 4) << 3); if (i > 55) { md5cycle(state, tail); for (var j = 0; j < 16; j++) tail[j] = 0; } tail[14] = n * 8; md5cycle(state, tail); return state; }
+					var hex_chr = "0123456789abcdef".split("");
+					function rhex(n) { var s2 = ""; for (var j2 = 0; j2 < 4; j2++) s2 += hex_chr[(n >> (j2*8+4)) & 0x0f] + hex_chr[(n >> (j2*8)) & 0x0f]; return s2; }
+					function add32(a, b) { return (a + b) & 0xffffffff; }
+					var st = md51(string); return rhex(st[0]) + rhex(st[1]) + rhex(st[2]) + rhex(st[3]);
+				}
+				var c = md5([f].join(""));
+				var d = md5(apiUrl);
+				var w = window;
+				if (typeof w.mnsv2 !== "function") { return JSON.stringify({ error: "mnsv2-unavailable" }); }
+				var s = w.mnsv2(f, c, d);
+				var alphabet = "ZmserbBoHQtNP+wOcza/LpngG8yJq42KWYj0DSfdikx3VT16IlUAFM97hECvuRX5";
+				function encodeUtf8(e) { var r = encodeURIComponent(e); var a = []; for (var i = 0; i < r.length; i++) { if (r.charCodeAt(i) === 37) { a.push(parseInt(r.substring(i+1, i+3), 16)); i += 2; } else { a.push(r.charCodeAt(i)); } } return a; }
+				function b64Encode(e) { var out = []; var u = 0; var l = e.length; for (; u + 2 < l; u += 3) { var b0 = e[u], b1 = e[u+1], b2 = e[u+2]; out.push(alphabet[b0 >> 2], alphabet[((b0 & 3) << 4) | (b1 >> 4)], alphabet[((b1 & 15) << 2) | (b2 >> 6)], alphabet[b2 & 63]); } var rem = l - u; if (rem === 1) { var r1 = e[u]; out.push(alphabet[r1 >> 2], alphabet[(r1 << 4) & 63], "=="); } else if (rem === 2) { var r2 = (e[u] << 8) + e[u+1]; out.push(alphabet[r2 >> 10], alphabet[(r2 >> 4) & 63], alphabet[(r2 << 2) & 63], "="); } return out.join(""); }
+				function crc32(e) { var r = 0xedb88320; var a = []; for (var i2 = 0; i2 < 256; i2++) { var v = i2; for (var j3 = 0; j3 < 8; j3++) v = v & 1 ? v >>> 1 ^ r : v >>> 1; a[i2] = v; } var d2 = -1; for (var i3 = 0; i3 < e.length; i3++) d2 = a[(d2 ^ e.charCodeAt(i3)) & 255] ^ d2 >>> 8; return (-1 ^ d2 ^ r) >>> 0; }
+				var platform = (w.navigator && w.navigator.platform) || "Win32";
+				var x4 = (apiData !== null && apiData !== undefined) ? typeof apiData : "";
+				var xsObj = { x0: "4.3.3", x1: "xhs-pc-web", x2: platform, x3: s, x4: x4 };
+				var xs = "XYS_" + b64Encode(encodeUtf8(JSON.stringify(xsObj)));
+				var a1Match = document.cookie.match(/a1=([^;]+)/);
+				var a1 = a1Match ? a1Match[1] : "";
+				var fingerprint = localStorage.getItem("b1") || "";
+				var xsCommonObj = { s0: 3, s1: "", x0: localStorage.getItem("b1b1") || "1", x1: "4.3.3", x2: platform, x3: "xhs-pc-web", x4: "6.2.1", x5: a1, x6: "", x7: "", x8: fingerprint, x9: crc32("" + fingerprint), x10: 0, x11: "normal", x12: (localStorage.getItem("dsllt") || "") + ";" + (w._dsl || "") };
+				var xsCommon = b64Encode(encodeUtf8(JSON.stringify(xsCommonObj)));
+				var hexChars = "abcdef0123456789";
+				var traceId = "";
+				for (var i4 = 0; i4 < 16; i4++) { traceId += hexChars.charAt(Math.floor(Math.random() * hexChars.length)); }
+				return JSON.stringify({ "x-s": xs, "x-t": String(timestamp), "x-s-common": xsCommon, "x-b3-traceid": traceId });
+			} catch (e) { return JSON.stringify({ error: (e && e.message) || "sign-via-page error" }); }
+		})()`;
+		try {
+			const raw = await this.eval<string>(code);
+			const p = raw ? (JSON.parse(raw) as Record<string, string>) : null;
+			if (p && p["x-s"]) {
+				this.log("signViaMnsv2：页面原生签名成功（window.mnsv2）");
+				return p;
+			}
+			this.log(`signViaMnsv2 失败：${p && p.error ? p.error : "无返回"}，回退本地签名`);
+			return null;
+		} catch (e) {
+			this.log(
+				`signViaMnsv2 eval 异常：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
+			);
+			return null;
+		}
+	}
+
 	private async signForNodeRequest(
 		cookieString: string,
 		method: "GET" | "POST",
@@ -965,15 +1079,35 @@ export class RedNoteSession {
 			"Referer": "https://www.xiaohongshu.com/",
 			"User-Agent": EDGE_UA,
 		};
-		// The reference sends Content-Type on EVERY request (GETs included).
-		headers["Content-Type"] = "application/json;charset=UTF-8";
+		// The commercial reference sends Content-Type WITHOUT charset.
+		headers["Content-Type"] = "application/json";
 		if (!opts.unsigned) {
-			const sign = await this.signForNodeRequest(cookieString, method, uri, data);
+			// Build the signPath FIRST: GET signs over path+query (the exact
+			// string the URL will carry); POST signs over the bare path (the
+			// JSON body is appended to the content string inside the signer).
+			let signPath = uri;
+			if (method === "GET" && data) {
+				const qs0 = buildGetQueryString(data);
+				if (qs0) {
+					signPath = `${uri}?${qs0}`;
+				}
+			}
+			// PRIMARY: genuine page signature via window.mnsv2 (the XHS
+			// page's own signing entry — same call the working commercial
+			// plugin makes from its webview). Falls back to the local
+			// ported signer when the page/function is unavailable.
+			const viaPage = await this.signViaPageMnsv2(
+				method === "GET" ? signPath : uri,
+				method === "POST" ? data : null,
+			);
+			const sign = viaPage ?? (await this.signForNodeRequest(cookieString, method, signPath, data));
 			headers["x-s"] = sign["x-s"] ?? "";
 			headers["x-t"] = sign["x-t"] ?? "";
 			headers["x-s-common"] = sign["x-s-common"] ?? "";
 			headers["x-b3-traceid"] = sign["x-b3-traceid"] ?? "";
-			headers["x-xray-traceid"] = sign["x-xray-traceid"] ?? "";
+			if (!viaPage && sign["x-xray-traceid"]) {
+				headers["x-xray-traceid"] = sign["x-xray-traceid"];
+			}
 			// Optional: captured from the page (see installPageRecorder). When
 			// interception fails, the request goes out WITHOUT this header.
 			const rap = await this.readRapParam();
