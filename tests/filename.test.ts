@@ -54,3 +54,44 @@ describe("resolveNoteFileName", () => {
 		expect(resolveNoteFileName("a/b", "id1", taken)).toBe("ab.md");
 	});
 });
+
+import { resolveRewriteFileName } from "../src/rednote/filename";
+
+describe("resolveRewriteFileName (M3 review fix 1: no copy accumulation)", () => {
+	it("unchanged title re-resolves the SAME name in place (old file not blocking)", () => {
+		// First sync wrote "标题.md"; second sync (content changed, same title)
+		// must land on the same name even though the name is now taken.
+		expect(
+			resolveRewriteFileName("标题", "65f2a8b3", new Set(["标题.md"]), "RedNote/Bookmarks/标题.md"),
+		).toBe("标题.md");
+	});
+
+	it("changed title resolves a fresh free name (old file excluded from the namespace)", () => {
+		expect(
+			resolveRewriteFileName(
+				"新标题",
+				"65f2a8b3",
+				new Set(["旧标题.md"]),
+				"RedNote/Bookmarks/旧标题.md",
+			),
+		).toBe("新标题.md");
+	});
+
+	it("a changed title colliding with ANOTHER note still gets the id suffix", () => {
+		expect(
+			resolveRewriteFileName(
+				"别人的",
+				"65f2a8b3",
+				new Set(["旧标题.md", "别人的.md"]),
+				"RedNote/Bookmarks/旧标题.md",
+			),
+		).toBe("别人的-a8b3.md");
+	});
+
+	it("without a previous file it behaves exactly like resolveNoteFileName", () => {
+		expect(resolveRewriteFileName("hello", "id0001", new Set(), undefined)).toBe("hello.md");
+		expect(resolveRewriteFileName("hello", "id0001", new Set(["hello.md"]), undefined)).toBe(
+			"hello-0001.md",
+		);
+	});
+});

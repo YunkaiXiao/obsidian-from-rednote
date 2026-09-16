@@ -5,6 +5,9 @@ import {
 	isoToDateOnly,
 	applyTagPrefix,
 	renderNoteMarkdown,
+	splitAiSection,
+	appendAiSection,
+	type NoteMediaMap,
 } from "../src/rednote/markdown";
 import type { RedNoteRecord } from "../src/rednote/types";
 
@@ -155,5 +158,106 @@ describe("renderNoteMarkdown", () => {
 		);
 		expect(md).toContain("created_at: \n");
 		expect(md).toContain("collected_at: \n");
+	});
+});
+
+describe("renderNoteMarkdown with M3 media map", () => {
+	it("embeds downloaded images as vault-relative paths", () => {
+		const media: NoteMediaMap = {
+			imageLocal: ["RedNote/Media/65f2a8b3000000001234abcd/1.webp", null],
+			videoLocal: null,
+		};
+		const md = renderNoteMarkdown(
+			sampleRecord({ images: ["https://cdn/1.webp", "https://cdn/2.webp"] }),
+			"xhs/",
+			media,
+		);
+		expect(md).toContain(
+			"![](RedNote/Media/65f2a8b3000000001234abcd/1.webp)",
+		);
+		// Slot without a local file keeps the remote URL.
+		expect(md).toContain("![](https://cdn/2.webp)");
+	});
+
+	it("keeps all-remote URLs when every download failed (all-null slots)", () => {
+		const md = renderNoteMarkdown(sampleRecord(), "xhs/", {
+			imageLocal: [null],
+			videoLocal: null,
+		});
+		expect(md).toContain("![](https://cdn/1.webp)");
+	});
+
+	it("links a downloaded video locally as [▶ 视频](path)", () => {
+		const md = renderNoteMarkdown(
+			sampleRecord({ type: "video", video_url: "http://video/1.mp4", images: [] }),
+			"xhs/",
+			{ imageLocal: [], videoLocal: "RedNote/Media/65f2a8b3000000001234abcd/video.mp4" },
+		);
+		expect(md).toContain(
+			"[▶ 视频](RedNote/Media/65f2a8b3000000001234abcd/video.mp4)",
+		);
+		expect(md).not.toContain("[▶ 观看视频]");
+	});
+
+	it("falls back to the remote video link when not downloaded (toggle off / failed)", () => {
+		const md = renderNoteMarkdown(
+			sampleRecord({ type: "video", video_url: "http://video/1.mp4", images: [] }),
+			"xhs/",
+			{ imageLocal: [], videoLocal: null },
+		);
+		expect(md).toContain("[▶ 观看视频](http://video/1.mp4)");
+	});
+});
+
+describe("splitAiSection", () => {
+	const OLD = `---
+note_id: "x"
+---
+
+# 标题
+
+正文
+
+## 🤖 AI 摘要
+### 视频转写
+（转写文字稿）
+`;
+
+	it("returns null when there is no AI section", () => {
+		expect(splitAiSection("# 标题\n\n正文\n")).toBeNull();
+		expect(splitAiSection("")).toBeNull();
+	});
+
+	it("returns the block from the heading to EOF, verbatim", () => {
+		const ai = splitAiSection(OLD);
+		expect(ai).not.toBeNull();
+		expect(ai).toBe("## 🤖 AI 摘要\n### 视频转写\n（转写文字稿）\n");
+	});
+
+	it("handles the heading as the very first line", () => {
+		expect(splitAiSection("## 🤖 AI 摘要\n内容")).toBe("## 🤖 AI 摘要\n内容");
+	});
+});
+
+describe("appendAiSection", () => {
+	const NEW = `---
+note_id: "x"
+---
+
+# 标题
+
+新正文
+`;
+	const OLD_WITH_AI = `# 标题\n\n旧正文\n\n## 🤖 AI 摘要\n### 图片分析\n（描述）\n`;
+	const OLD_WITHOUT_AI = `# 标题\n\n旧正文\n`;
+
+	it("appends the preserved AI block after one blank line", () => {
+		const out = appendAiSection(NEW, OLD_WITH_AI);
+		expect(out).toBe(NEW + "\n## 🤖 AI 摘要\n### 图片分析\n（描述）\n");
+		expect(out).toContain("新正文\n\n## 🤖 AI 摘要");
+	});
+
+	it("returns new content unchanged when the old note has no AI section", () => {
+		expect(appendAiSection(NEW, OLD_WITHOUT_AI)).toBe(NEW);
 	});
 });

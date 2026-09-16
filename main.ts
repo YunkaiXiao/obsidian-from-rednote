@@ -12,6 +12,7 @@ import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginView, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
+import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
 	evaluateRateLimit,
 	normalizeRateLimitState,
@@ -29,8 +30,14 @@ export interface RedNoteSyncSettings {
 	tagPrefix: string;
 	notesFolder: string;
 	mediaFolder: string;
-	/** note_ids already synced (M2 dedup; full content-hash incremental is M3). */
-	syncedNoteIds: string[];
+	/**
+	 * Incremental note index (M3): note_id -> { hash, syncedAt, file }.
+	 * Replaces the legacy syncedNoteIds array (migrated once on load; the old
+	 * field is never written again — no unbounded array growth).
+	 */
+	noteIndex: NoteIndex;
+	/** Download video files into the media folder (default off: disk space). */
+	downloadVideos: boolean;
 	/** ISO 8601 of the last successful sync. */
 	lastSyncAt: string;
 	/** Rate limit (feature #14): max notes processed per window. */
@@ -53,7 +60,8 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	tagPrefix: "xhs/",
 	notesFolder: "RedNote/Bookmarks",
 	mediaFolder: "RedNote/Media",
-	syncedNoteIds: [],
+	noteIndex: {},
+	downloadVideos: false,
 	lastSyncAt: "",
 	rateLimitMaxNotes: 20,
 	rateLimitWindowMinutes: 10,
@@ -152,7 +160,22 @@ export default class RedNoteSyncPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const loaded = (await this.loadData()) as Record<string, unknown> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+		// M3 one-shot migration: legacy syncedNoteIds array -> noteIndex entries
+		// with hash "" ("content unknown, reconcile next sync"). The legacy field
+		// is removed and never written again (bounded per-note entries replace
+		// the unbounded array).
+		if (hasLegacyNoteIds(loaded?.["syncedNoteIds"])) {
+			this.settings.noteIndex = migrateLegacyNoteIds(
+				loaded?.["syncedNoteIds"],
+				this.settings.noteIndex ?? {},
+				this.settings.lastSyncAt || new Date().toISOString(),
+			);
+			delete (this.settings as unknown as Record<string, unknown>)["syncedNoteIds"];
+			await this.saveSettings();
+			console.log("[pull-rednote] 已将旧版 syncedNoteIds 迁移为 noteIndex（hash 待对账）");
+		}
 	}
 
 	/** Open the login page in a workspace leaf (tab) and keep the session. */
@@ -244,8 +267,10 @@ export default class RedNoteSyncPlugin extends Plugin {
 		}
 
 		this.syncing = true;
-		const syncedSet = new Set(this.settings.syncedNoteIds);
-		// note_ids written during this run; persisted incrementally below.
+		// Working copy of the incremental index; entries are persisted
+		// incrementally via onNoteIndexed below (M3 replaces syncedNoteIds).
+		const noteIndex: NoteIndex = { ...this.settings.noteIndex };
+		// Settled notes this run (writes + reconciles) for the abort notices.
 		const newIds = new Set<string>();
 
 		// Rate limit state (feature #14): loaded from data.json so a restart
@@ -268,11 +293,13 @@ export default class RedNoteSyncPlugin extends Plugin {
 			const result = await syncFavorites(this.app.vault, this.session, {
 				notesFolder: this.settings.notesFolder,
 				tagPrefix: this.settings.tagPrefix,
-				syncedNoteIds: syncedSet,
+				noteIndex,
+				mediaFolder: this.settings.mediaFolder,
+				downloadVideos: this.settings.downloadVideos,
 				onPage: (page: number) => {
 					new Notice(`正在同步第 ${page} 页…`);
 				},
-				// Called before each NEW note's detail fetch. When the window
+				// Called before each note's detail fetch. When the window
 				// budget is exhausted, show the Notice and wait out the window,
 				// then continue automatically. runSync already runs as a
 				// background async task; closing Obsidian is the cancel path.
@@ -291,26 +318,36 @@ export default class RedNoteSyncPlugin extends Plugin {
 						);
 					}
 				},
-				onNotePersisted: (noteId: string) => {
-					// Persist the id the instant its .md is on disk, so a mid-run
-					// abort (e.g. login expiry) does not lose already-written notes.
-					if (syncedSet.has(noteId) || newIds.has(noteId)) {
-						return;
-					}
-					newIds.add(noteId);
-					syncedSet.add(noteId);
-					this.settings.syncedNoteIds = Array.from(syncedSet);
-					// A fully processed note (detail fetch + write) counts
-					// against the current rate limit window.
+				onDetailFetched: () => {
+					// Review fix 2: the detail REQUEST is what costs a window slot,
+					// so the budget is consumed here exactly once per successful
+					// fetch — skip / reconcile / rewrite all account identically
+					// (previously skips fetched details for free while writes
+					// double-charged via onNoteIndexed).
 					rateState = recordProcessed(rateState, rateCfg, Date.now());
+					return persistRateState();
+				},
+				onNoteIndexed: (noteId: string, hash: string, file: string) => {
+					// Persist the index entry the instant the note is on disk (or
+					// reconciled), so a mid-run abort (e.g. login expiry) does not
+					// redo already-settled notes. Budget was already consumed by
+					// onDetailFetched — no recordProcessed here.
+					noteIndex[noteId] = {
+						hash,
+						syncedAt: epochToIso(Date.now(), XHS_UTC_OFFSET_MIN),
+						...(file ? { file } : {}),
+					};
+					this.settings.noteIndex = noteIndex;
+					newIds.add(noteId);
 					return persistRateState();
 				},
 			});
 
 			// Full success: record completion time (lastSyncAt keeps its
 			// "round finished" semantic — not set on an interrupted run).
-			// (ids were already persisted incrementally; this is a no-op merge.)
-			this.settings.syncedNoteIds = Array.from(new Set([...syncedSet, ...result.newNoteIds]));
+			// (index entries were already persisted incrementally; this is a
+			// no-op re-assign.)
+			this.settings.noteIndex = noteIndex;
 			this.settings.lastSyncAt = epochToIso(Date.now(), XHS_UTC_OFFSET_MIN);
 			await this.saveSettings();
 
@@ -539,6 +576,20 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 					.setValue(settings.mediaFolder)
 					.onChange(async (value: string) => {
 						settings.mediaFolder = value.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("下载视频文件")
+			.setDesc(
+				"开启后视频笔记的视频文件将下载到媒体目录——视频体积大，可能占用大量磁盘空间，请确认剩余容量。关闭时正文仅记录视频链接（默认关闭）",
+			)
+			.addToggle((toggle: ToggleComponent) => {
+				toggle
+					.setValue(settings.downloadVideos)
+					.onChange(async (value: boolean) => {
+						settings.downloadVideos = value;
 						await this.plugin.saveSettings();
 					});
 			});

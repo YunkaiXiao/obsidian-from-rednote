@@ -77,6 +77,18 @@ function renderYamlStringList(items: string[], indent: string): string {
 }
 
 /**
+ * Local media paths resolved by the M3 media downloader, mapped onto the
+ * rendered body. Absent entries (or null slots) fall back to the M2 remote
+ * URL behavior, so a failed download degrades gracefully per file.
+ */
+export interface NoteMediaMap {
+	/** Local vault-relative path per image (index-aligned with record.images); null = keep remote URL. */
+	imageLocal: ReadonlyArray<string | null>;
+	/** Local video path when downloaded; null = remote link. */
+	videoLocal: string | null;
+}
+
+/**
  * Render the full note Markdown for a record, per docs/note-template.md.
  *
  * Field ordering matches the template: note_id, type, title, author, author_id,
@@ -87,13 +99,21 @@ function renderYamlStringList(items: string[], indent: string): string {
  *  - H1 title
  *  - `> [!info] 来源` callout with author / publish / collected / open-link
  *  - body text
- *  - for image notes: each image embedded as a remote `![](url)` (M2 temp)
- *  - for video notes: a markdown link to the video URL (M2 temp)
+ *  - for image notes: each image embedded as a LOCAL vault-relative
+ *    `![](RedNote/Media/{note_id}/n.ext)` when downloaded (M3), else the
+ *    remote `![](url)` fallback (M2 behavior)
+ *  - for video notes: a markdown link — local `[▶ 视频](path)` when the video
+ *    was downloaded (M3, toggle on), else the remote `[▶ 观看视频](url)` link
  *
  * @param record  The normalized note record.
  * @param tagPrefix  User tag prefix setting (default "xhs/").
+ * @param media  Optional local-media path map (M3 downloads).
  */
-export function renderNoteMarkdown(record: RedNoteRecord, tagPrefix: string): string {
+export function renderNoteMarkdown(
+	record: RedNoteRecord,
+	tagPrefix: string,
+	media?: NoteMediaMap,
+): string {
 	const tags = applyTagPrefix(record.tags, tagPrefix);
 
 	const fm: string[] = [];
@@ -131,11 +151,14 @@ export function renderNoteMarkdown(record: RedNoteRecord, tagPrefix: string): st
 	}
 
 	if (record.type === "image") {
-		for (const url of record.images) {
-			bodyLines.push(`![](${url})`);
-		}
+		record.images.forEach((url, i) => {
+			const local = media?.imageLocal[i];
+			bodyLines.push(`![](${local || url})`);
+		});
 	} else if (record.type === "video") {
-		if (record.video_url) {
+		if (media?.videoLocal) {
+			bodyLines.push(`[▶ 视频](${media.videoLocal})`);
+		} else if (record.video_url) {
 			bodyLines.push(`[▶ 观看视频](${record.video_url})`);
 		}
 	}
@@ -143,4 +166,45 @@ export function renderNoteMarkdown(record: RedNoteRecord, tagPrefix: string): st
 	const body = bodyLines.join("\n\n");
 
 	return `${frontmatter}\n\n${heading}\n\n${callout}\n\n${body}\n`;
+}
+
+/**
+ * Heading that opens the AI block (M4 writes it; M3 must preserve it).
+ * Kept as a single constant so producer (M4) and preserver (M3) agree.
+ */
+export const AI_SECTION_HEADING = "## 🤖 AI 摘要";
+
+/**
+ * Extract the AI section (`## 🤖 AI 摘要` line to end-of-file) from an
+ * existing note's markdown, for the M3 rewrite path's hard constraint:
+ * re-synced notes keep their AI block verbatim. Returns null when the note
+ * has no AI section (the rewritten note then gets none either).
+ */
+export function splitAiSection(existing: string): string | null {
+	if (!existing) {
+		return null;
+	}
+	const idx = existing.indexOf(`\n${AI_SECTION_HEADING}`);
+	if (idx < 0) {
+		// Headless edge: the heading as the very first line of the file.
+		if (existing.startsWith(AI_SECTION_HEADING)) {
+			return existing;
+		}
+		return null;
+	}
+	return existing.slice(idx + 1);
+}
+
+/**
+ * Append the preserved AI block from `oldContent` (if any) to freshly
+ * rendered `newContent`, separated by one blank line. Pure.
+ */
+export function appendAiSection(newContent: string, oldContent: string): string {
+	const ai = splitAiSection(oldContent);
+	if (!ai) {
+		return newContent;
+	}
+	// renderNoteMarkdown ends with exactly one "\n"; add one blank line so the
+	// heading starts its own paragraph, then the block verbatim to EOF.
+	return `${newContent.replace(/\n*$/, "\n")}\n${ai}`;
 }

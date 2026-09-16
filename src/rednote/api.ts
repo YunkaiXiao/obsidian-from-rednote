@@ -45,6 +45,7 @@ import {
 	isXhsHost,
 	joinCookies,
 	newXrayTraceid,
+	EDGE_UA as WIRE_EDGE_UA,
 } from "./wire";
 
 /** The partition isolates this session from Obsidian's default browser session. */
@@ -61,12 +62,10 @@ const CHROME_UA =
 	"Chrome/153.0.0.0 Safari/537.36";
 
 /**
- * UA for plugin-process (requestUrl) data requests — the reference
- * implementation's Edge 142 UA, copied verbatim.
+ * UA for plugin-process data requests — now shared with the media downloader
+ * via wire.ts (single source of truth; same verbatim reference value).
  */
-const EDGE_UA =
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
-	"Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0";
+const EDGE_UA = WIRE_EDGE_UA;
 
 /**
  * Keep our webview partition FREE of Obsidian's per-partition webRequest hooks.

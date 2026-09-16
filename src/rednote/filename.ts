@@ -78,3 +78,35 @@ export function resolveNoteFileName(
 	}
 	return fallback;
 }
+
+/**
+ * Resolve the file name for a RE-SYNC (M3 rewrite path).
+ *
+ * The note's previous file (if any) is REMOVED from the taken-name set before
+ * resolving, so an unchanged title re-resolves to the SAME name and the note
+ * is rewritten in place — feeding the old name into the taken set would force
+ * a new suffixed copy on every sync (the M3 review's copy-accumulation
+ * defect). A genuinely changed title resolves to a fresh free name; the
+ * caller then writes the new file and deletes `prevFile`.
+ *
+ * @param rawTitle    The (new) raw note title.
+ * @param noteId      The full note id (collision suffix source).
+ * @param takenNames  File names currently present in the notes folder.
+ * @param prevFile    Vault-relative path of the note's previous .md (or undefined).
+ * @returns The target `.md` file NAME (basename).
+ */
+export function resolveRewriteFileName(
+	rawTitle: string,
+	noteId: string,
+	takenNames: ReadonlySet<string>,
+	prevFile: string | undefined,
+): string {
+	const taken = new Set(takenNames);
+	if (prevFile) {
+		const prevBase = prevFile.slice(prevFile.lastIndexOf("/") + 1);
+		if (prevBase) {
+			taken.delete(prevBase);
+		}
+	}
+	return resolveNoteFileName(rawTitle, noteId, taken);
+}
