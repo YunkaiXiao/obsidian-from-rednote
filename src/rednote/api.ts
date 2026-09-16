@@ -290,6 +290,14 @@ function navEventUrl(e: Event): string | undefined {
 
 /** Thrown when a page request fails after one retry (non-login error). */
 export class FetchError extends Error {
+	/**
+	 * Raw response body, when the error originated from an HTTP response
+	 * (M3.2 diagnostics: a business-code failure like board/user's
+	 * HTTP200 code=-1 success=false carries its reason in the body — callers
+	 * log this so a missing-parameter diagnosis is possible from the log).
+	 */
+	responseText?: string;
+
 	constructor(message: string) {
 		super(message);
 		this.name = "FetchError";
@@ -1263,9 +1271,13 @@ export class RedNoteSession {
 			if (isAuthy && json.success === false) {
 				throw new NotLoggedInError(`登录已失效：${json.msg || "接口要求登录"}`);
 			}
-			throw new FetchError(
+			const bizErr = new FetchError(
 				`接口 ${uri} 返回失败：${json.msg ?? JSON.stringify(json).slice(0, 200)}`,
 			);
+			// M3.2: carry the raw body so callers (fetchUserBoards) can log what
+			// the server actually said on a signature-passing business failure.
+			bizErr.responseText = resp.text ?? "";
+			throw bizErr;
 		}
 		throw new FetchError(
 			`接口 ${uri} 返回非 JSON（HTTP ${status}）：${String(resp.text ?? "").slice(0, 120)}`,
@@ -1727,13 +1739,30 @@ export class RedNoteSession {
 	 * across payloads (board_name / name / title).
 	 */
 	async fetchUserBoards(userId: string): Promise<RedNoteBoard[]> {
-		const data = await this.request("GET", "/api/sns/web/v1/board/user", {
-			user_id: userId,
-		});
+		let data: Record<string, unknown>;
+		try {
+			data = await this.request("GET", "/api/sns/web/v1/board/user", {
+				user_id: userId,
+			});
+		} catch (e) {
+			// M3.2 diagnostics: the endpoint can fail at the BUSINESS layer with
+			// HTTP 200 (observed live: code=-1 success=false — signature passes,
+			// boards silently degrade to the flat fallback). Log the response
+			// body so a missing-parameter diagnosis is possible from debug.log.
+			const body = (e as { responseText?: string }).responseText;
+			if (typeof body === "string" && body.length > 0) {
+				this.log(`board/user 业务失败响应体（前300字符）：${body.slice(0, 300)}`);
+			}
+			throw e;
+		}
 		this.log(
 			`board/user 原始返回（截断）：${JSON.stringify(data ?? null).slice(0, 1500)}`,
 		);
-		return parseBoardList(data);
+		const boards = parseBoardList(data);
+		if (boards.length === 0) {
+			this.log("board/user 解析到 0 个收藏夹（响应 data 见上方原始返回日志）");
+		}
+		return boards;
 	}
 
 	/**

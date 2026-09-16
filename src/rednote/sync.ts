@@ -6,6 +6,11 @@
 // M3.1: source order is 收藏夹 boards first (board/user -> board/note per
 // board, cards carry collection = 收藏夹 name), then the flat collect/page
 // fallback; a run-scoped seen Set dedupes note_ids across both sources.
+// M3.2: list-layer incremental stop — a card whose note_id already has a
+// settled (non-"" hash) index entry is "known" and NEVER triggers a detail
+// request; a full page of known cards ends that list's pagination early
+// (XHS lists favorites newest-first), and a non-advancing next_cursor
+// terminates the loop instead of re-listing the same batch forever.
 //
 // Pure decision logic (filename, render, page parse, extraction, hash) lives in
 // the pure modules and is unit-tested; this file only orchestrates side effects.
@@ -36,6 +41,12 @@ export interface SyncOptions {
 	 * Incremental note index (M3): note_id -> { hash, syncedAt, file }.
 	 * Replaces the M2 syncedNoteIds skip list. hash "" (migrated legacy entry)
 	 * means "content unknown": reconciled on the next run, never rewritten.
+	 * M3.2: also the read-only view for the list-layer incremental stop — a
+	 * card whose note_id has an entry with a NON-empty hash is "known" (no
+	 * detail request, no processNote); a full page of known cards stops that
+	 * list's pagination. The caller keeps this object fresh in-run (main.ts's
+	 * onNoteIndexed writes settled entries back), so reconciled sentinels and
+	 * fresh writes become "known" for the remaining pages of the same run.
 	 */
 	noteIndex: NoteIndex;
 	/** Vault-relative media folder, e.g. "RedNote/Media" (M3 media downloads). */
@@ -154,6 +165,12 @@ function logPageDiag(
  *  - every list request (boards list + each page) goes through the same
  *    rate-limit gate/billing as the note detail fetches
  *
+ * List-layer incremental stop (M3.2): a card whose note_id has a settled
+ * (non-"" hash) index entry is KNOWN and never reaches processNote (no detail
+ * request is spent on it); a full page of known cards ends that list's
+ * pagination, and a non-advancing next_cursor terminates the loop (the
+ * endpoints can return the same cursor — and thus the same batch — forever).
+ *
  * Per-note state machine (M3, unchanged, identical for both sources):
  *  - no index entry          -> write fresh + download media
  *  - hash equal              -> skip entirely (no write, no download)
@@ -217,6 +234,43 @@ export async function syncFavorites(
 	//    encounter (board or flat) is never processed again this run. Memory
 	//    only — the persisted noteIndex stays untouched.
 	const seen = new Set<string>();
+
+	// M3.2 list-layer incremental skip: a card with a settled (non-sentinel,
+	// non-"" hash) index entry is KNOWN — it skips processNote entirely, so no
+	// detail request is spent on unchanged favorites. Sentinel (hash "")
+	// entries are deliberately NOT known: they still walk the reconcile path
+	// once (detail fetched, hash stored, no rewrite).
+	const isKnownNote = (noteId: string): boolean => {
+		const entry = opts.noteIndex[noteId];
+		return entry != null && entry.hash !== "";
+	};
+
+	/**
+	 * Partition one page's fresh (first-encounter) cards into known / to
+	 * process. `pageAllKnown` is the M3.2 incremental-stop signal: the page
+	 * had at least one card and every fresh card was index-known. Pages made
+	 * purely of run-scoped duplicates (fresh empty — e.g. boards sharing
+	 * notes) do NOT count as fully known: they may precede unique content,
+	 * and the cursor guard below is the anti-loop defense for those.
+	 */
+	const partitionKnown = (
+		fresh: RedNoteRaw[],
+	): { toProcess: RedNoteRaw[]; knownCount: number; pageAllKnown: boolean } => {
+		const toProcess: RedNoteRaw[] = [];
+		let knownCount = 0;
+		for (const card of fresh) {
+			if (isKnownNote(card.note_id)) {
+				knownCount += 1;
+			} else {
+				toProcess.push(card);
+			}
+		}
+		return {
+			toProcess,
+			knownCount,
+			pageAllKnown: fresh.length > 0 && knownCount === fresh.length,
+		};
+	};
 
 	// Shared per-note pipeline (the M3 state machine, unchanged) for BOTH
 	// sources: board cards (collection = 收藏夹 name) and flat fallback cards
@@ -429,11 +483,38 @@ export async function syncFavorites(
 			boardCards += p.items.length;
 			const { fresh, duplicates } = splitSeen(p.items, seen);
 			result.duplicates += duplicates;
-			for (const card of fresh) {
+			const { toProcess, knownCount, pageAllKnown } = partitionKnown(fresh);
+			if (knownCount > 0) {
+				session.log(
+					`增量：收藏夹「${board.name || board.board_id}」第 ${boardPage} 页已知 ${knownCount} 张，免详情请求`,
+				);
+			}
+			result.skipped += knownCount;
+			for (const card of toProcess) {
 				await processNote(card, board.name);
+			}
+			// M3.2 incremental stop (per board, pages counted independently): a
+			// FULL page of known cards means the rest of this board's list is
+			// older known content — stop before burning more list requests.
+			if (pageAllKnown) {
+				session.log(
+					`增量停止于第 ${boardPage} 页（整页卡片已知，终止翻页）：收藏夹「${board.name || board.board_id}」`,
+				);
+				boardFinished = true;
+				break;
 			}
 			// Pagination termination (identical guard as the flat loop).
 			if (!p.has_more || !p.next_cursor) {
+				boardFinished = true;
+				break;
+			}
+			// M3.2 cursor-stall guard (observed live: the flat/board endpoint can
+			// return the SAME next_cursor on consecutive pages, re-listing the
+			// same batch forever): a non-advancing cursor terminates the loop.
+			if (p.next_cursor === boardCursor) {
+				session.log(
+					`cursor 未推进，终止翻页（收藏夹「${board.name || board.board_id}」第 ${boardPage} 页，cursor ${p.next_cursor.slice(0, 8)}）`,
+				);
 				boardFinished = true;
 				break;
 			}
@@ -458,12 +539,33 @@ export async function syncFavorites(
 		result.flatNotes += p.items.length;
 		const { fresh, duplicates } = splitSeen(p.items, seen);
 		result.duplicates += duplicates;
-		for (const card of fresh) {
+		const { toProcess, knownCount, pageAllKnown } = partitionKnown(fresh);
+		if (knownCount > 0) {
+			session.log(`增量：flat 列表第 ${page} 页已知 ${knownCount} 张，免详情请求`);
+		}
+		result.skipped += knownCount;
+		for (const card of toProcess) {
 			await processNote(card, "");
+		}
+
+		// M3.2 incremental stop: a FULL page of known cards means everything
+		// after it is older known content — stop before burning more requests.
+		if (pageAllKnown) {
+			session.log(`增量停止于第 ${page} 页（整页卡片已知，终止翻页）：flat 收藏列表`);
+			finished = true;
+			break;
 		}
 
 		// Pagination termination.
 		if (!p.has_more || !p.next_cursor) {
+			finished = true;
+			break;
+		}
+		// M3.2 cursor-stall guard (identical to the boards loop).
+		if (p.next_cursor === cursor) {
+			session.log(
+				`cursor 未推进，终止翻页（flat 第 ${page} 页，cursor ${p.next_cursor.slice(0, 8)}）`,
+			);
 			finished = true;
 			break;
 		}
