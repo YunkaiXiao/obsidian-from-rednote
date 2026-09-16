@@ -140,6 +140,60 @@ type WebviewEl = HTMLElement & {
 export { isXhsHost } from "./wire";
 
 /**
+ * Plain Node HTTPS JSON request (desktop plugin has Node access). Replaces
+ * obsidian requestUrl as the API transport: standalone probing proved the
+ * identical header set + signature gets 200 via a plain HTTPS client while
+ * requestUrl gets 406 (it stamps its own request identity).
+ */
+function nodeHttpsJson(
+	url: string,
+	method: string,
+	headers: Record<string, string>,
+	body?: string,
+): Promise<{ status: number; text: string }> {
+	return new Promise((resolve, reject) => {
+		try {
+			const reqquire = (window as unknown as { require?: (m: string) => unknown }).require;
+			const https = reqquire?.("https") as typeof import("https") | undefined;
+			if (!https) {
+				reject(new Error("Node https 模块不可用"));
+				return;
+			}
+			const u = new URL(url);
+			const req = https.request(
+				{
+					hostname: u.hostname,
+					path: u.pathname + u.search,
+					method,
+					headers,
+					timeout: 20_000,
+				},
+				(res) => {
+					let d = "";
+					res.on("data", (c: Buffer) => {
+						d += c.toString("utf8");
+					});
+					res.on("end", () => {
+						resolve({ status: res.statusCode ?? 0, text: d });
+					});
+				},
+			);
+			req.on("error", reject);
+			req.on("timeout", () => {
+				req.destroy();
+				reject(new Error("请求超时（20s）"));
+			});
+			if (body) {
+				req.write(body);
+			}
+			req.end();
+		} catch (e) {
+			reject(e instanceof Error ? e : new Error(String(e)));
+		}
+	});
+}
+
+/**
  * Extract the target URL from a webview navigation event's `detail`.
  * Returns undefined when no URL is present (e.g. a bare Event), in which case
  * the caller treats it as "not off-domain" and does nothing.
@@ -797,10 +851,14 @@ export class RedNoteSession {
 		let resp: { status: number; json: Record<string, unknown> | null; text?: string } | null =
 			null;
 		try {
-			const r = await requestUrl({ url: fullUrl, method, headers, body, throw: false });
+			// TRANSPORT: raw Node https, NOT obsidian requestUrl — a standalone
+			// probe proved identical headers+signature get HTTP 200 via a plain
+			// HTTPS client while requestUrl gets 406 (it stamps its own
+			// request identity, which XHS rejects).
+			const r = await nodeHttpsJson(fullUrl, method, headers, body);
 			let json: Record<string, unknown> | null = null;
 			try {
-				json = r.json as Record<string, unknown> | null;
+				json = JSON.parse(r.text) as Record<string, unknown> | null;
 			} catch {
 				/* non-JSON body — surfaced through the text branch below */
 			}
@@ -979,7 +1037,15 @@ export class RedNoteSession {
 			try {
 				if (!window.__pullWarmupDone) {
 					window.__pullWarmupDone = true;
-					const warmInit = { method: "POST", credentials: "include", headers: { "content-type": "application/json;charset=UTF-8" }, body: "{}" };
+					// EXACT homefeed payload from the reference implementation —
+					// XHS's wrapper only signs/rap's requests it recognizes; a
+					// bare "{}" body was ignored (no capture ever happened).
+					const warmBody = JSON.stringify({
+						cursor_score: "", num: 1, refresh_type: 1, note_index: 0,
+						unread_begin_note_id: "", unread_end_note_id: "", unread_note_count: 0,
+						category: "homefeed_recommend", search_key: "",
+					});
+					const warmInit = { method: "POST", credentials: "include", headers: { "content-type": "application/json;charset=UTF-8" }, body: warmBody };
 					window.fetch("https://edith.xiaohongshu.com/api/sns/web/v1/homefeed", warmInit).catch(function () {});
 				}
 			} catch (errW) {}
