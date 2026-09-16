@@ -28,7 +28,7 @@ import { mergeNoteCard } from "./extract";
 // xhsSignXyw = CURRENT XYW_ (AES-128-CBC) X-S format. The legacy XYS_ variant
 // (xhsSign) stays in sign.ts as a backup path — since ~2026-03 data-fetching
 // APIs reject XYS_ with {success:false}.
-import { xhsSignXyw, generateB1, xhsQueryEscape } from "./sign";
+import { xhsSign, xhsSignXyw, generateB1, xhsQueryEscape } from "./sign";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
@@ -139,6 +139,15 @@ function navEventUrl(e: Event): string | undefined {
 		}
 	}
 	return undefined;
+}
+
+/** n lowercase hex chars (for x-xray-traceid, matching the page's format). */
+function randomHex(n: number): string {
+	let s = "";
+	for (let i = 0; i < n; i++) {
+		s += Math.floor(Math.random() * 16).toString(16);
+	}
+	return s;
 }
 
 
@@ -478,11 +487,14 @@ export class RedNoteSession {
 			);
 		}
 
-		// (2) LOCAL signing (primary) — XYW_ (AES-128-CBC) format, required by
-		// data-fetching APIs since ~2026-03 (XYS_ gets {success:false}).
+		// (2) LOCAL signing (primary) — XYS_ format: the page's OWN successful
+		// requests (observed live via the setRequestHeader hook on this exact
+		// webview session) still use X-S=XYS_…, so the earlier "XYS_ is
+		// rejected" theory was wrong — our 406s came from request-shape
+		// differences (missing x-xray-traceid etc.), not the X-S format.
 		if (a1) {
 			try {
-				const sign = xhsSignXyw(uri, method, data, a1, b1 || generateB1());
+				const sign = xhsSign(uri, method, data, a1, b1 || generateB1());
 				return sign;
 			} catch (e) {
 				console.warn(
@@ -598,6 +610,10 @@ export class RedNoteSession {
 			headers["X-T"] = sign["X-T"];
 			headers["x-s-common"] = sign["x-s-common"];
 			headers["X-B3-Traceid"] = sign["X-B3-Traceid"];
+			// x-xray-traceid: observed on the page's OWN successful edith
+			// requests (18 lowercase hex chars). Absent from ours — one of the
+			// remaining request-shape differences vs the page.
+			headers["x-xray-traceid"] = randomHex(18);
 		}
 
 		// Build the full URL. For GET, the query string MUST be encoded exactly
