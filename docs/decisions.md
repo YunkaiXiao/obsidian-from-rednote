@@ -155,3 +155,11 @@
 - 修复：①`initCleanPartition()` 包装 `ipcRenderer.send` 吞掉本分区的 create-browser-session（钩子永不安装；session 构造时执行）②恢复 useragent 属性（顺序：useragent→partition→attach→src；干净分区下属性真正生效）用本机 Chrome 153 版本号 ③干净分区无 session 级权限沙箱→元素级 permissionrequest 拒绝兜底 ④runSync 加即时 Notice（30 秒静默体验问题）
 - 已知代价（引用）：失去 Obsidian 对该分区的广告过滤（本就无此需求）；分区 cookie 不受影响（沿用 persist:rednote-sync，登录态保留）
 - 待真机验证：406 是否消失、同步全链路
+
+## ADR-018 视频在线处理（不落盘优先）（2026-09-16，用户需求）
+
+- 原则：**vault 永不存储视频本体**，视频处理优先走"不下载"路径
+- 轨道①（插件即时处理）：优先把小红书原始视频 URL 直传多模态 API（GLM-4V 系列支持 video_url 字段，模型服务端自行拉流）；实现时做接口能力探测，不支持 URL 的端点降级为下载后上传
+- 轨道②（ZCode 处理）：视频拉到**系统临时目录**（非 vault），ffmpeg 支持对 URL 流式 seek（抽帧只拉所需数据段），音频同理抽取后转写；处理完清理临时文件
+- 已知约束：小红书视频 CDN 链接带签名会过期——"同步后即时处理"无碍；存量旧笔记 URL 失效时自动降级为"经 cookie 重新解析视频地址"或提示重新同步该篇
+- 与 ADR-016 关键帧的关系：流式 seek 抽帧即关键帧实现的基础动作
