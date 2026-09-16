@@ -406,10 +406,13 @@ export class RedNoteSession {
 		});
 		el.addEventListener("dom-ready", () => {
 			console.log("[pull-rednote] webview dom-ready");
-			// Install the request recorder + x-rap-param interceptor on EVERY
-			// dom-ready (idempotent in-page), so plugin-process requests can
-			// capture x-rap-param even when the login leaf is closed and this
-			// webview was lazily recreated offscreen for a sync run.
+		});
+		// Install the recorder + x-rap-param interceptor AFTER the full load —
+		// dom-ready was TOO EARLY: XHS's signing wrapper patches window.fetch
+		// during app hydration, and a warmup fired before that goes out
+		// unsigned (no x-rap-param ever produced). did-finish-load means the
+		// page (incl. its app JS) has loaded. Re-install is idempotent.
+		el.addEventListener("did-finish-load", () => {
 			void this.installPageRecorder();
 		});
 		el.addEventListener("did-fail-load", (e: Event) => {
@@ -665,6 +668,7 @@ export class RedNoteSession {
 		// fire into an unhooked page (observed: 10s timeout, no capture).
 		await this.installPageRecorder();
 		const deadline = Date.now() + 10_000;
+		let rewarmed = false;
 		while (Date.now() < deadline) {
 			try {
 				const v = await this.eval<string>('String(window.__capturedRapParam || "")');
@@ -675,6 +679,13 @@ export class RedNoteSession {
 				}
 			} catch {
 				// Page not ready / eval failed: keep polling until the deadline.
+			}
+			// Re-warm once mid-poll: XHS's wrapper may attach after our first
+			// attempt; a second homefeed POST through the now-patched fetch
+			// produces x-rap-param.
+			if (!rewarmed && Date.now() > deadline - 6_500) {
+				rewarmed = true;
+				await this.installPageRecorder({ rewarm: true });
 			}
 			await new Promise<void>((resolve) => window.setTimeout(resolve, 400));
 		}
@@ -1039,8 +1050,9 @@ export class RedNoteSession {
 	 * through XHR/axios — a fetch-only hook misses them (learned the hard
 	 * way). Called on dom-ready, before the page's organic request burst.
 	 */
-	async installPageRecorder(): Promise<void> {
+	async installPageRecorder(opts: { rewarm?: boolean } = {}): Promise<void> {
 		const code = `(() => {
+			${opts.rewarm ? 'try { delete window.__pullWarmupDone; } catch (eRew) {}' : ""}
 			if (window.__pullHooked) { return "already"; }
 			window.__pullHooked = true;
 			window.__pullReqs = [];
