@@ -253,6 +253,10 @@ export class RedNoteLoginView extends ItemView {
 		attach("dom-ready", () => {
 			this.setStatus("页面已加载 ✓");
 			this.kickGuestResize();
+			// Install the request recorder BEFORE the page's organic API burst
+			// (fetch + XHR — XHS's own calls go through XHR/axios, which a
+			// fetch-only hook misses entirely).
+			void this.session.installPageRecorder();
 		});
 		attach("did-stop-loading", () => this.setStatus("页面已加载 ✓"));
 		attach("did-fail-load", (e: Event): void => {

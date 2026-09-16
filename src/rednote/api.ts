@@ -703,6 +703,64 @@ export class RedNoteSession {
 	 * embed login state in window.__INITIAL_STATE__ and logged-in pages carry
 	 * the avatar/sidebar chrome. Returns {ok, info} for UI surfacing.
 	 */
+	/**
+	 * Install (idempotently) the page-request recorder: hooks BOTH fetch and
+	 * XMLHttpRequest so the statuses of the PAGE'S OWN edith API calls are
+	 * captured. XHS's organic calls go through XHR/axios — a fetch-only hook
+	 * misses them (learned the hard way). Called on dom-ready, before the
+	 * page's organic request burst.
+	 */
+	async installPageRecorder(): Promise<void> {
+		const code = `(() => {
+			if (window.__pullHooked) { return "already"; }
+			window.__pullHooked = true;
+			window.__pullReqs = [];
+			const mark = function (url, via) {
+				const e = { u: String(url).slice(0, 90), s: 0, v: via };
+				window.__pullReqs.push(e);
+				return e;
+			};
+			try {
+				const of = window.fetch;
+				window.fetch = function () {
+					const a = arguments;
+					const url = String(a[0]);
+					if (url.indexOf("edith.xiaohongshu.com") >= 0) {
+						const e = mark(url, "fetch");
+						return of.apply(this, a).then(function (r) { e.s = r.status; return r; });
+					}
+					return of.apply(this, a);
+				};
+			} catch (err) {}
+			try {
+				const ox = XMLHttpRequest.prototype.open;
+				const os = XMLHttpRequest.prototype.send;
+				XMLHttpRequest.prototype.open = function (mth, url) {
+					try { this.__pullUrl = String(url); } catch (err) {}
+					return ox.apply(this, arguments);
+				};
+				XMLHttpRequest.prototype.send = function () {
+					const self = this;
+					try {
+						if (this.__pullUrl && this.__pullUrl.indexOf("edith.xiaohongshu.com") >= 0) {
+							const e = mark(this.__pullUrl, "xhr");
+							this.addEventListener("loadend", function () {
+								try { e.s = self.status; } catch (err2) {}
+							});
+						}
+					} catch (err3) {}
+					return os.apply(this, arguments);
+				};
+			} catch (err4) {}
+			return "installed";
+		})()`;
+		try {
+			await this.eval<string>(code);
+		} catch {
+			/* recorder is best-effort diagnostics */
+		}
+	}
+
 	async checkLoginViaPage(): Promise<{ ok: boolean; info: string }> {
 		// Fully defensive: XHS pages can make window.__INITIAL_STATE__ access
 		// throw (guarded getters), and an eval that rejects surfaces as a
