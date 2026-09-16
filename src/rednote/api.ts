@@ -123,7 +123,7 @@ export function initCleanPartition(log?: (line: string) => void): void {
 }
 
 const HOST = "https://edith.xiaohongshu.com";
-const INDEX_URL = "https://www.xiaohongshu.com";
+const INDEX_URL = "https://www.xiaohongshu.com/explore"; // explore: page-load fires a signed homefeed POST (carries x-rap-param for capture) — same landing as the reference plugin
 
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
