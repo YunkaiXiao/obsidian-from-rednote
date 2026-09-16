@@ -164,8 +164,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 	}
 
 	/**
-	 * Update + persist login state, then (re)verify against the selfinfo API so
-	 * the stored flag reflects reality rather than a stale UI signal.
+	 * Update + persist login state, then (re)verify against the v2/user/me API
+	 * so the stored flag reflects reality rather than a stale UI signal.
 	 */
 	async updateLoginState(logged: boolean): Promise<void> {
 		if (logged) {
@@ -214,7 +214,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 			}
 		}
 		// Gate 2: confirm the session is actually still valid (the webview may
-		// have lost it). Re-verify via the selfinfo endpoint.
+		// have lost it). Re-verify via the v2/user/me endpoint (page probe
+		// fallback inside checkLogin).
 		try {
 			const ok = await this.session.checkLogin();
 			if (!ok) {

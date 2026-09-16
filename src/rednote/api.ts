@@ -1,21 +1,29 @@
 // Side-effect module: embedded webview session + signed XHS API client.
 //
-// Data path (per ADR-007): the API requests are issued from INSIDE the
-// already-loaded Xiaohongshu webview page context, so cookies and the browser
-// signing are handled by XHS's own front-end JS. This avoids reimplementing the
-// signature algorithm and survives algorithm changes.
+// Data path (supersedes ADR-007's in-webview fetch, mirroring the verified
+// reference implementation ytf606/xhs2obsidian sign-manager): requests are
+// issued from the PLUGIN PROCESS via obsidian requestUrl with
+//   - Cookie       : extracted from the persist:rednote-sync partition
+//                    (Electron remote session; includes HttpOnly cookies),
+//   - signatures   : computed locally (sign.ts, xhshow-lineage XYS_ format),
+//   - x-rap-param  : captured from the webview page by installPageRecorder's
+//                    interceptor + homefeed warmup (optional header; requests
+//                    go out without it when capture fails).
+// The webview stays resident for login + page probes + rap-param capture, but
+// data requests no longer execute inside the page context.
 //
 // Verified against (2026-09-14):
 //  - MediaCrawler (NanmiCoder/MediaCrawler) media_platform/xhs/{client,core,help,login}.py
 //  - ReaJason/xhs (the library MediaCrawler's xhs module builds on) xhs/core.py
-//    * favorites list : GET  /api/sns/web/v2/note/collect/page  {user_id,num,cursor}
+//    * favorites list : GET  /api/sns/web/v2/note/collect/page  {cursor,num,user_id,image_formats}
 //    * note detail    : POST /api/sns/web/v1/feed               -> items[0].note_card
-//    * login check    : GET  /api/sns/web/v1/user/selfinfo      -> data.result.success
+//    * login check    : GET  /api/sns/web/v2/user/me (Cookie-only) -> data.userInfo.user_id
 //    * host           : edith.xiaohongshu.com
-//    * UA             : stable Chrome (MediaCrawler core.py user_agent)
 //
-// This file imports obsidian; keep it OUT of unit tests (tests only touch the
-// pure modules).
+// This file imports obsidian; keep it OUT of unit tests (the request-shape
+// helpers live in ./wire.ts, which the tests cover directly).
+
+import { requestUrl } from "obsidian";
 
 import {
 	NotLoggedInError,
@@ -28,7 +36,15 @@ import { mergeNoteCard } from "./extract";
 // xhsSignXyw = CURRENT XYW_ (AES-128-CBC) X-S format. The legacy XYS_ variant
 // (xhsSign) stays in sign.ts as a backup path — since ~2026-03 data-fetching
 // APIs reject XYS_ with {success:false}.
-import { xhsSign, xhsSignXyw, generateB1, xhsQueryEscape } from "./sign";
+import { xhsSign, xhsSignXyw, generateB1 } from "./sign";
+import {
+	buildCollectPageParams,
+	buildGetQueryString,
+	extractCookieValue,
+	isXhsHost,
+	joinCookies,
+	newXrayTraceid,
+} from "./wire";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
@@ -42,6 +58,14 @@ const WEBVIEW_PARTITION = "persist:rednote-sync";
 const CHROME_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
 	"Chrome/153.0.0.0 Safari/537.36";
+
+/**
+ * UA for plugin-process (requestUrl) data requests — the reference
+ * implementation's Edge 142 UA, copied verbatim.
+ */
+const EDGE_UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+	"Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0";
 
 /**
  * Keep our webview partition FREE of Obsidian's per-partition webRequest hooks.
@@ -100,14 +124,6 @@ export function initCleanPartition(log?: (line: string) => void): void {
 
 const HOST = "https://edith.xiaohongshu.com";
 const INDEX_URL = "https://www.xiaohongshu.com";
-/** Allowed host suffixes for in-webview navigation (XHS domains only). */
-const ALLOWED_HOSTS = [
-	"www.xiaohongshu.com",
-	"edith.xiaohongshu.com",
-	"xiaohongshu.com",
-	"rednote.com",
-	"xhscdn.com",
-];
 
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
@@ -116,14 +132,11 @@ type WebviewEl = HTMLElement & {
 	reload?: () => void;
 };
 
-export function isXhsHost(url: string): boolean {
-	try {
-		const host = new URL(url).hostname.toLowerCase();
-		return ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
-	} catch {
-		return false;
-	}
-}
+/**
+ * Webview navigation-sandbox predicate — pure logic now lives in ./wire.ts
+ * (re-exported here so existing importers of api.ts keep working).
+ */
+export { isXhsHost } from "./wire";
 
 /**
  * Extract the target URL from a webview navigation event's `detail`.
@@ -140,16 +153,6 @@ function navEventUrl(e: Event): string | undefined {
 	}
 	return undefined;
 }
-
-/** n lowercase hex chars (for x-xray-traceid, matching the page's format). */
-function randomHex(n: number): string {
-	let s = "";
-	for (let i = 0; i < n; i++) {
-		s += Math.floor(Math.random() * 16).toString(16);
-	}
-	return s;
-}
-
 
 /** Thrown when a page request fails after one retry (non-login error). */
 export class FetchError extends Error {
@@ -278,6 +281,11 @@ export class RedNoteSession {
 		});
 		el.addEventListener("dom-ready", () => {
 			console.log("[pull-rednote] webview dom-ready");
+			// Install the request recorder + x-rap-param interceptor on EVERY
+			// dom-ready (idempotent in-page), so plugin-process requests can
+			// capture x-rap-param even when the login leaf is closed and this
+			// webview was lazily recreated offscreen for a sync run.
+			void this.installPageRecorder();
 		});
 		el.addEventListener("did-fail-load", (e: Event) => {
 			// Electron exposes these fields directly on the event; some builds
@@ -384,6 +392,9 @@ export class RedNoteSession {
 			this.container = null;
 			this.webview = null;
 			this.readyPromise = null;
+			// Fresh page -> let readRapParam() capture again (the warmup is
+			// re-armed by installPageRecorder on the next page's dom-ready).
+			this.rapParamCache = null;
 		});
 
 		this.readyPromise = new Promise<void>((resolve) => {
@@ -429,6 +440,7 @@ export class RedNoteSession {
 		this.container = null;
 		this.webview = null;
 		this.readyPromise = null;
+		this.rapParamCache = null;
 	}
 
 	/**
@@ -441,6 +453,127 @@ export class RedNoteSession {
 			throw new SignError("webview.executeJavaScript 不可用，无法在页面上下文执行请求");
 		}
 		return (await wv.executeJavaScript(code)) as T;
+	}
+
+	/**
+	 * Full Cookie header value for edith.xiaohongshu.com requests.
+	 *
+	 * PRIMARY: the persist:rednote-sync partition's cookie store via Electron's
+	 * remote session — includes HttpOnly cookies (web_session) that
+	 * document.cookie can never see.
+	 * FALLBACK (degraded, reason logged): document.cookie inside the webview —
+	 * non-HttpOnly cookies only, so requests built from it may not authenticate.
+	 * Returns "" when both paths fail.
+	 */
+	async getCookieString(): Promise<string> {
+		try {
+			const req = (window as unknown as { require?: (m: string) => unknown }).require;
+			const electron = req?.("electron") as
+				| {
+						remote?: {
+							session?: {
+								fromPartition?: (partition: string) => {
+									cookies: {
+										get: (filter: { url: string }) => Promise<Array<{ name: string; value: string }>>;
+									};
+								};
+							};
+						};
+				  }
+				| undefined;
+			const fromPartition = electron?.remote?.session?.fromPartition;
+			if (!fromPartition) {
+				this.log("getCookieString：electron.remote.session 不可用，降级 document.cookie");
+			} else {
+				const cookies = await fromPartition(WEBVIEW_PARTITION).cookies.get({
+					url: "https://www.xiaohongshu.com",
+				});
+				if (Array.isArray(cookies) && cookies.length > 0) {
+					return joinCookies(
+						cookies.map((c) => ({ name: String(c.name), value: String(c.value) })),
+					);
+				}
+				this.log("getCookieString：分区 cookie 为空（未登录或读取被拒），降级 document.cookie");
+			}
+		} catch (e) {
+			this.log(
+				`getCookieString：分区 cookie 读取失败（${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}），降级 document.cookie`,
+			);
+		}
+		try {
+			const raw = await this.eval<string>("String(document.cookie || \"\")");
+			if (typeof raw === "string" && raw.length > 0) {
+				return raw;
+			}
+		} catch (e) {
+			this.log(
+				`getCookieString：document.cookie 读取也失败：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
+			);
+		}
+		return "";
+	}
+
+	/**
+	 * Memoized x-rap-param capture (see installPageRecorder for the producer).
+	 * First call polls window.__capturedRapParam every 400ms for up to 10s;
+	 * the outcome (value OR "not captured") is cached so later requests don't
+	 * re-stall. The cache resets whenever the webview is destroyed/recreated
+	 * (fresh page -> fresh capture chance via the one-shot warmup).
+	 */
+	private rapParamCache: string | null = null;
+
+	async readRapParam(): Promise<string> {
+		if (this.rapParamCache !== null) {
+			return this.rapParamCache;
+		}
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			try {
+				const v = await this.eval<string>('String(window.__capturedRapParam || "")');
+				if (typeof v === "string" && v.length > 0) {
+					this.log("readRapParam：已截获 x-rap-param，后续请求将携带");
+					this.rapParamCache = v;
+					return v;
+				}
+			} catch {
+				// Page not ready / eval failed: keep polling until the deadline.
+			}
+			await new Promise<void>((resolve) => window.setTimeout(resolve, 400));
+		}
+		this.log("readRapParam：10s 内未截获 x-rap-param，请求不带该头照发");
+		this.rapParamCache = "";
+		return "";
+	}
+
+	/**
+	 * Signed headers for the plugin-process path: a1 comes from the extracted
+	 * cookie string, b1 from the page's localStorage (best effort, synthesized
+	 * when absent) — the same inputs xhshow/MediaCrawler use. When no a1 can be
+	 * parsed (cookie extraction failed entirely), falls back to the legacy
+	 * getSign() flow (page-cookie a1 -> local sign -> page-sign probe).
+	 */
+	private async signForNodeRequest(
+		cookieString: string,
+		method: "GET" | "POST",
+		uri: string,
+		data: Record<string, unknown> | null,
+	): Promise<RedNoteSign> {
+		const a1 = extractCookieValue(cookieString, "a1");
+		if (a1) {
+			let b1 = "";
+			try {
+				const raw = await this.eval<string>(
+					'(() => { try { return String((window.localStorage && window.localStorage.getItem("b1")) || ""); } catch (e) { return ""; } })()',
+				);
+				if (typeof raw === "string") {
+					b1 = raw;
+				}
+			} catch {
+				/* localStorage read is best effort — generateB1() covers it */
+			}
+			return xhsSign(uri, method, data, a1, b1 || generateB1());
+		}
+		return await this.getSign(method, uri, data);
 	}
 
 	/**
@@ -578,8 +711,13 @@ export class RedNoteSession {
 	}
 
 	/**
-	 * Issue a signed request from inside the webview page context.
-	 * Returns the parsed `data` field of the XHS response envelope.
+	 * Issue a signed request and return the parsed `data` field of the XHS
+	 * response envelope.
+	 *
+	 * Transport is now the PLUGIN PROCESS (nodeRequest below — obsidian
+	 * requestUrl + partition Cookie + local signature + captured x-rap-param);
+	 * the previous in-webview page-context fetch path was removed. See the
+	 * module header for the new pipeline.
 	 *
 	 * On an unauthenticated response it throws NotLoggedInError so the caller
 	 * can guide the user to re-login.
@@ -590,83 +728,95 @@ export class RedNoteSession {
 		data: Record<string, unknown> | null,
 		opts: { unsigned?: boolean } = {},
 	): Promise<Record<string, unknown>> {
+		return this.nodeRequest(method, uri, data, opts);
+	}
+
+	/**
+	 * Plugin-process request pipeline (reference: ytf606/xhs2obsidian
+	 * sign-manager): obsidian requestUrl transport + partition Cookie +
+	 * Origin/Referer/UA headers + the five signature headers + optional
+	 * captured x-rap-param. The GET query string and the signed content string
+	 * are composed by the SAME ordered helpers (wire.ts), so the server
+	 * reconstructs exactly the string that was signed.
+	 *
+	 * The REQ log (status/code/success) and the error mapping
+	 * (NotLoggedInError / FetchError / 300011/300012 risk-control codes) keep
+	 * the semantics of the previous page-context implementation.
+	 */
+	async nodeRequest(
+		method: "GET" | "POST",
+		uri: string,
+		data: Record<string, unknown> | null,
+		opts: { unsigned?: boolean } = {},
+	): Promise<Record<string, unknown>> {
+		const cookieString = await this.getCookieString();
 		const headers: Record<string, string> = {
-			accept: "application/json, text/plain, */*",
+			"Cookie": cookieString,
+			"Origin": "https://www.xiaohongshu.com",
+			"Referer": "https://www.xiaohongshu.com/",
+			"User-Agent": EDGE_UA,
 		};
-		// content-type ONLY on POST with a body — a bodyless GET carrying a
-		// JSON content-type is unnatural (the page's own GETs don't) and is a
-		// prime 406 discriminator between our requests and the page's.
 		if (method === "POST") {
-			headers["content-type"] = "application/json;charset=UTF-8";
+			headers["Content-Type"] = "application/json;charset=UTF-8";
 		}
-		// Signing requires a page-context function (window._webmsxyw & al.) that
-		// is not guaranteed to exist at any given moment. Callers that do NOT
-		// need signatures (selfinfo responds to cookies alone — MediaCrawler's
-		// pong check) pass { unsigned: true } so a missing sign function cannot
-		// break login detection.
 		if (!opts.unsigned) {
-			const sign = await this.getSign(method, uri, data);
+			const sign = await this.signForNodeRequest(cookieString, method, uri, data);
 			headers["X-S"] = sign["X-S"];
 			headers["X-T"] = sign["X-T"];
 			headers["x-s-common"] = sign["x-s-common"];
 			headers["X-B3-Traceid"] = sign["X-B3-Traceid"];
-			// x-xray-traceid: observed on the page's OWN successful edith
-			// requests (18 lowercase hex chars). Absent from ours — one of the
-			// remaining request-shape differences vs the page.
-			headers["x-xray-traceid"] = randomHex(18);
+			// x-xray-traceid: hex((epochMs << 23) | seq) + 16 random hex chars
+			// (reference sign-manager format).
+			headers["x-xray-traceid"] = newXrayTraceid(Date.now());
+			// Optional: captured from the page (see installPageRecorder). When
+			// interception fails, the request goes out WITHOUT this header.
+			const rap = await this.readRapParam();
+			if (rap) {
+				headers["x-rap-param"] = rap;
+			}
 		}
 
-		// Build the full URL. For GET, the query string MUST be encoded exactly
-		// like the signed content string (xhsQueryEscape = Python
-		// quote(safe=",")) or the server reconstructs a different string and
-		// rejects the signature. This matches MediaCrawler's _build_query_string.
+		// Build the full URL and body. For GET, the query string MUST be
+		// encoded exactly like the signed content string (xhsQueryEscape =
+		// Python quote(safe=",")) and in the same order, or the server
+		// reconstructs a different string and rejects the signature.
 		let fullUrl = HOST + uri;
-		const body: string | undefined =
-			method === "POST" && data ? JSON.stringify(data) : undefined;
-
-		const init: Record<string, unknown> = {
-			method,
-			headers,
-			credentials: "include",
-		};
+		let body: string | undefined;
 		if (method === "GET" && data) {
-			const qs = Object.entries(data)
-				.map(([k, v]) => `${k}=${xhsQueryEscape(String(v))}`)
-				.join("&");
-			fullUrl = `${fullUrl}?${qs}`;
-		} else if (method === "POST" && body !== undefined) {
-			init.body = body;
+			const qs = buildGetQueryString(data);
+			if (qs) {
+				fullUrl = `${fullUrl}?${qs}`;
+			}
+		} else if (method === "POST" && data) {
+			body = JSON.stringify(data);
 		}
 
-		const code = `
-			(() => {
-				return fetch(${JSON.stringify(fullUrl)}, ${JSON.stringify(init)}).then(async (resp) => {
-					let text = await resp.text();
-					let json = null;
-					try { json = JSON.parse(text); } catch (e) {}
-					return JSON.stringify({ status: resp.status, json: json, text: text.slice(0, 500) });
-				});
-			})()
-		`;
 		// One REQ line per request in debug.log (session.log), including every
 		// failure/exception branch below — the sync path stays fully traceable.
 		const reqTag = `REQ ${method} ${uri.slice(0, 60)}`;
-		let parsed: { status: number; json: Record<string, unknown> | null; text?: string } | null = null;
+		let resp: { status: number; json: Record<string, unknown> | null; text?: string } | null =
+			null;
 		try {
-			const raw = await this.eval<string>(code);
-			parsed = raw ? JSON.parse(raw) : null;
+			const r = await requestUrl({ url: fullUrl, method, headers, body, throw: false });
+			let json: Record<string, unknown> | null = null;
+			try {
+				json = r.json as Record<string, unknown> | null;
+			} catch {
+				/* non-JSON body — surfaced through the text branch below */
+			}
+			resp = { status: r.status, json, text: r.text };
 		} catch (e) {
 			this.log(`${reqTag} -> EXC ${e instanceof Error ? e.message : String(e)}`);
 			throw e;
 		}
-		if (!parsed) {
+		if (!resp) {
 			this.log(`${reqTag} -> ERR 无返回`);
 			throw new FetchError(`请求 ${uri} 无返回`);
 		}
 
-		const status = parsed.status as number;
+		const status = resp.status;
 		{
-			const j = parsed.json;
+			const j = resp.json;
 			const codeStr = j && j.code != null ? String(j.code) : "-";
 			const successStr = j && j.success != null ? String(j.success) : "-";
 			this.log(`${reqTag} -> HTTP${status} code=${codeStr} success=${successStr}`);
@@ -675,7 +825,7 @@ export class RedNoteSession {
 			throw new NotLoggedInError("登录已失效，请重新登录");
 		}
 
-		const json: Record<string, unknown> | null = parsed.json;
+		const json: Record<string, unknown> | null = resp.json;
 		if (json && typeof json === "object") {
 			const codeStr = json.code != null ? String(json.code) : "";
 			// 300011 security limit / 300012 IP block (per MediaCrawler client)
@@ -687,12 +837,13 @@ export class RedNoteSession {
 			if (json.success === true) {
 				return (json.data ?? json) as Record<string, unknown>;
 			}
-			// Not-logged-in style response (selfinfo / list with no result.success).
-			// Observed envelope for logged-out selfinfo is {"code":-1,"success":false}
+			// Not-logged-in style response (auth-checking URIs). Observed
+			// envelope for logged-out checks is {"code":-1,"success":false}
 			// with NO msg — so treat ANY success:false on auth-checking URIs as
 			// NotLoggedInError instead of requiring a msg heuristic.
 			const isAuthy =
 				uri.includes("user/selfinfo") ||
+				uri.includes("user/me") ||
 				uri.includes("collect/page") ||
 				uri.includes("/feed");
 			if (isAuthy && json.success === false) {
@@ -703,13 +854,15 @@ export class RedNoteSession {
 			);
 		}
 		throw new FetchError(
-			`接口 ${uri} 返回非 JSON（HTTP ${status}）：${String(parsed.text ?? "").slice(0, 120)}`,
+			`接口 ${uri} 返回非 JSON（HTTP ${status}）：${String(resp.text ?? "").slice(0, 120)}`,
 		);
 	}
 
 	/**
-	 * Check login state via the selfinfo endpoint (verified in MediaCrawler
-	 * client.pong / query_self: success when data.result.success is true).
+	 * Check login state via the unsigned /api/sns/web/v2/user/me endpoint
+	 * (Cookie header alone — reference sign-manager): data.userInfo.user_id
+	 * present means logged in. Any API-channel failure falls through to the
+	 * page probe (below), which stays as the fallback.
 	 */
 	/**
 	 * Last login-check outcome for UI surfacing (null = no recorded reason).
@@ -725,11 +878,16 @@ export class RedNoteSession {
 	 * the avatar/sidebar chrome. Returns {ok, info} for UI surfacing.
 	 */
 	/**
-	 * Install (idempotently) the page-request recorder: hooks BOTH fetch and
-	 * XMLHttpRequest so the statuses of the PAGE'S OWN edith API calls are
-	 * captured. XHS's organic calls go through XHR/axios — a fetch-only hook
-	 * misses them (learned the hard way). Called on dom-ready, before the
-	 * page's organic request burst.
+	 * Install (idempotently) the page-request recorder PLUS the x-rap-param
+	 * interceptor (reference: ytf606/xhs2obsidian). Three hooks push any value
+	 * named x-rap-param into window.__capturedRapParam for readRapParam() to
+	 * poll: Headers.prototype.set/append, window.fetch (init headers), and
+	 * XMLHttpRequest.prototype.setRequestHeader. A ONE-SHOT warmup (guarded by
+	 * window.__pullWarmupDone so polling never re-fires it) POSTs to
+	 * homefeed with credentials, coaxing XHS's own request wrapper into
+	 * emitting x-rap-param. Hooks both fetch and XHR: XHS's organic calls go
+	 * through XHR/axios — a fetch-only hook misses them (learned the hard
+	 * way). Called on dom-ready, before the page's organic request burst.
 	 */
 	async installPageRecorder(): Promise<void> {
 		const code = `(() => {
@@ -741,11 +899,45 @@ export class RedNoteSession {
 				window.__pullReqs.push(e);
 				return e;
 			};
+			window.__capturedRapParam = window.__capturedRapParam || "";
+			const RAP = "x-rap-param";
+			const noteRap = function (v) {
+				try {
+					if (typeof v === "string" && v && window.__capturedRapParam !== v) {
+						window.__capturedRapParam = v;
+					}
+				} catch (errR) {}
+			};
+			try {
+				const ohs = Headers.prototype.set;
+				Headers.prototype.set = function (n, v) {
+					try { if (String(n).toLowerCase() === RAP) { noteRap(String(v)); } } catch (errH) {}
+					return ohs.apply(this, arguments);
+				};
+				const oha = Headers.prototype.append;
+				Headers.prototype.append = function (n, v) {
+					try { if (String(n).toLowerCase() === RAP) { noteRap(String(v)); } } catch (errH2) {}
+					return oha.apply(this, arguments);
+				};
+			} catch (errH3) {}
 			try {
 				const of = window.fetch;
 				window.fetch = function () {
 					const a = arguments;
 					const url = String(a[0]);
+					try {
+						const h = a[1] && a[1].headers;
+						if (h) {
+							if (typeof Headers !== "undefined" && h instanceof Headers) {
+								const rv = h.get(RAP);
+								if (rv) { noteRap(rv); }
+							} else if (typeof h === "object") {
+								for (const hk in h) {
+									if (String(hk).toLowerCase() === RAP) { noteRap(String(h[hk])); }
+								}
+							}
+						}
+					} catch (errF) {}
 					if (url.indexOf("edith.xiaohongshu.com") >= 0) {
 						const e = mark(url, "fetch");
 						return of.apply(this, a).then(function (r) { e.s = r.status; return r; });
@@ -758,6 +950,7 @@ export class RedNoteSession {
 				const os = XMLHttpRequest.prototype.send;
 				const osh = XMLHttpRequest.prototype.setRequestHeader;
 				XMLHttpRequest.prototype.setRequestHeader = function (n, v) {
+					try { if (String(n).toLowerCase() === RAP) { noteRap(String(v)); } } catch (errX) {}
 					try {
 						if (this.__pullUrl && this.__pullUrl.indexOf("edith.xiaohongshu.com") >= 0) {
 							if (!window.__pullHdrs) { window.__pullHdrs = {}; }
@@ -783,12 +976,19 @@ export class RedNoteSession {
 					return os.apply(this, arguments);
 				};
 			} catch (err4) {}
+			try {
+				if (!window.__pullWarmupDone) {
+					window.__pullWarmupDone = true;
+					const warmInit = { method: "POST", credentials: "include", headers: { "content-type": "application/json;charset=UTF-8" }, body: "{}" };
+					window.fetch("https://edith.xiaohongshu.com/api/sns/web/v1/homefeed", warmInit).catch(function () {});
+				}
+			} catch (errW) {}
 			return "installed";
 		})()`;
 		try {
 			await this.eval<string>(code);
 		} catch {
-			/* recorder is best-effort diagnostics */
+			/* recorder / interceptor is best-effort diagnostics */
 		}
 	}
 
@@ -907,33 +1107,32 @@ export class RedNoteSession {
 	}
 
 	async checkLogin(): Promise<boolean> {
-		// SIGNED ONLY: unsigned selfinfo is a guaranteed HTTP 406 in 2026 —
-		// every unsigned attempt is pure risk-control noise (hours of 2s
-		// polling with unsigned-first eventually got the whole session 406-
-		// blocked on the server side). The page probe remains the fallback.
+		// API channel: unsigned GET /api/sns/web/v2/user/me (Cookie header
+		// alone). No signature is needed, so a missing/unavailable signer can
+		// never break login detection. Any failure falls through to the page
+		// probe, which remains the fallback.
 		this.lastCheckInfo = null;
 		const parts: string[] = [];
 		try {
-			const data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, {});
-			const result = (data?.result ?? data) as Record<string, unknown> | undefined;
-			if (result?.success === true) {
-				return true;
-			}
+			const data = await this.request("GET", "/api/sns/web/v2/user/me", {}, { unsigned: true });
+			const userInfo = data?.userInfo as Record<string, unknown> | undefined;
 			if (
-				result?.success === undefined &&
-				(result?.basic_info != null || result?.user_id != null)
+				userInfo &&
+				typeof userInfo === "object" &&
+				userInfo.user_id != null &&
+				String(userInfo.user_id).length > 0
 			) {
 				return true;
 			}
-			parts.push("签名=响应无登录标记");
+			parts.push("接口=响应无 user_id");
 		} catch (e) {
 			if (e instanceof NotLoggedInError) {
-				parts.push("签名=拒");
+				parts.push("接口=拒");
 			} else {
 				parts.push(
-					`签名=错:${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
+					`接口=错:${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`,
 				);
-				console.warn("[pull-rednote] checkLogin signed failed:", e);
+				console.warn("[pull-rednote] checkLogin user/me failed:", e);
 			}
 		}
 		parts.push("页面探测…");
@@ -1044,16 +1243,20 @@ export class RedNoteSession {
 	/**
 	 * Fetch one page of the favorites list.
 	 * Endpoint (verified): GET /api/sns/web/v2/note/collect/page
+	 *
+	 * Query order matches the reference implementation: optional cursor ->
+	 * num -> user_id -> image_formats=jpg,webp,avif (commas literal). The
+	 * same ordered object feeds both the signed content string and the URL.
 	 */
 	async fetchFavoritesPage(
 		userId: string,
 		cursor: string,
 	): Promise<{ items: RedNoteRaw[]; has_more: boolean; next_cursor: string }> {
-		const data = (await this.request("GET", "/api/sns/web/v2/note/collect/page", {
-			user_id: userId,
-			num: 30,
-			cursor,
-		})) as unknown as RawListData;
+		const data = (await this.request(
+			"GET",
+			"/api/sns/web/v2/note/collect/page",
+			buildCollectPageParams(userId, cursor),
+		)) as unknown as RawListData;
 		const page = parseListPage(data);
 		return page;
 	}

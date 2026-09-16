@@ -1,10 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { isXhsHost } from "../src/rednote/api";
+import { isXhsHost } from "../src/rednote/wire";
 
 // isXhsHost is the pure predicate behind the in-webview navigation gate
-// (api.ts). It must accept xiaohongshu.com AND its subdomains (www., edith.,
-// xhscdn., rednote.) and reject everything else, so the gate can pull the
-// webview back to the XHS home page on an off-domain navigation.
+// (defined in wire.ts, re-exported by api.ts). It must accept xiaohongshu.com
+// AND its subdomains (www., edith., xhscdn., rednote.) and reject everything
+// else, so the gate can pull the webview back to the XHS home page on an
+// off-domain navigation.
 
 describe("isXhsHost", () => {
 	it("accepts the apex xiaohongshu.com host", () => {

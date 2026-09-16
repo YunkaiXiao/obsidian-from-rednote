@@ -1,0 +1,143 @@
+// Pure request-shape helpers for the plugin-process API pipeline
+// (requestUrl + partition Cookie + captured x-rap-param, mirroring the
+// verified reference implementation ytf606/xhs2obsidian sign-manager).
+//
+// This module is pure (no obsidian/electron imports) so it can be unit-tested
+// in vitest and imported from anywhere. The query composition here is shared
+// by BOTH the actually-requested URL and the signed content string, so the
+// server reconstructs exactly the string that was signed.
+
+import { xhsQueryEscape } from "./sign";
+
+/** `num` parameter of the favorites (collect) list endpoint. */
+export const COLLECT_PAGE_NUM = 30;
+
+/**
+ * `image_formats` literal sent with collect/page. Commas MUST stay literal in
+ * the URL (xhsQueryEscape keeps them raw, matching Python quote(safe=",")),
+ * which is why this is stored pre-joined instead of as an array.
+ */
+export const COLLECT_IMAGE_FORMATS = "jpg,webp,avif";
+
+/**
+ * Ordered GET params for /api/sns/web/v2/note/collect/page, matching the
+ * reference implementation: optional cursor -> num -> user_id ->
+ * image_formats. Object insertion order IS the wire order (and the order the
+ * signature content string is built with).
+ *
+ * @param userId the logged-in user's id
+ * @param cursor pagination cursor ("" on the first page -> param omitted)
+ */
+export function buildCollectPageParams(userId: string, cursor: string): Record<string, string> {
+	const params: Record<string, string> = {};
+	if (cursor) {
+		params.cursor = cursor;
+	}
+	params.num = String(COLLECT_PAGE_NUM);
+	params.user_id = userId;
+	params.image_formats = COLLECT_IMAGE_FORMATS;
+	return params;
+}
+
+/**
+ * Serialize GET params exactly like the signed content string:
+ * "k=esc(v)&k2=esc(v2)" with xhsQueryEscape (Python quote(safe=",")) — commas
+ * stay literal, so image_formats=jpg,webp,avif is sent unencoded.
+ */
+export function buildGetQueryString(params: Record<string, unknown>): string {
+	return Object.entries(params)
+		.map(([k, v]) => `${k}=${xhsQueryEscape(String(v))}`)
+		.join("&");
+}
+
+/** One cookie as returned by Electron session.cookies.get. */
+export interface RawCookie {
+	name: string;
+	value: string;
+}
+
+/**
+ * Join cookies into a Cookie header value: "n=v; n2=v2" (empty input -> "").
+ */
+export function joinCookies(cookies: RawCookie[]): string {
+	return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+}
+
+/**
+ * Read one cookie's value out of a raw "a=b; c=d" string. Values are
+ * best-effort decoded (mirrors the page-eval a1 reader in api.ts); a value
+ * that is not valid percent-encoding is returned as-is. Returns "" when the
+ * name is absent.
+ */
+export function extractCookieValue(cookieString: string, name: string): string {
+	for (const part of cookieString.split(";")) {
+		const eq = part.indexOf("=");
+		if (eq <= 0) {
+			continue;
+		}
+		if (part.slice(0, eq).trim() === name) {
+			const raw = part.slice(eq + 1).trim();
+			try {
+				return decodeURIComponent(raw);
+			} catch {
+				return raw;
+			}
+		}
+	}
+	return "";
+}
+
+/**
+ * x-xray-traceid wire format (reference sign-manager):
+ *   hex((milliseconds << 23) | sequence) + 16 random lowercase hex chars.
+ * The sequence occupies the low 23 bits (must stay below 2^23 so it ORs
+ * without carrying into the timestamp). Uses BigInt: ms<<23 far exceeds the
+ * 32-bit range.
+ *
+ * @param nowMs   epoch milliseconds
+ * @param seq     random sequence number (< 2^23)
+ * @param randHex exactly 16 lowercase hex chars
+ */
+export function buildXrayTraceid(nowMs: number, seq: number, randHex: string): string {
+	const combined = (BigInt(nowMs) << 23n) | (BigInt(seq) & 0x7fffffn);
+	return combined.toString(16) + randHex;
+}
+
+/** n lowercase hex chars. */
+export function randomHex(n: number): string {
+	let s = "";
+	for (let i = 0; i < n; i++) {
+		s += Math.floor(Math.random() * 16).toString(16);
+	}
+	return s;
+}
+
+/** Fresh x-xray-traceid: random 23-bit sequence + 16 random hex chars. */
+export function newXrayTraceid(nowMs: number): string {
+	const seq = Math.floor(Math.random() * 0x7fffff);
+	return buildXrayTraceid(nowMs, seq, randomHex(16));
+}
+
+// ---------------------------------------------------------------------------
+// Webview navigation-sandbox host allowlist (pure predicate; kept here so the
+// unit test can import it without pulling api.ts' obsidian dependency).
+// ---------------------------------------------------------------------------
+
+/** Allowed host suffixes for in-webview navigation (XHS domains only). */
+const ALLOWED_HOSTS = [
+	"www.xiaohongshu.com",
+	"edith.xiaohongshu.com",
+	"xiaohongshu.com",
+	"rednote.com",
+	"xhscdn.com",
+];
+
+/** True when `url` is on xiaohongshu.com / rednote.com / xhscdn.com (or a subdomain). */
+export function isXhsHost(url: string): boolean {
+	try {
+		const host = new URL(url).hostname.toLowerCase();
+		return ALLOWED_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+	} catch {
+		return false;
+	}
+}
