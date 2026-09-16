@@ -183,3 +183,10 @@
 - 教训链（为何本地签名全败）：XYS_/XYW_ 本地算法产出的签名在严格端点（collect/page）全部被拒——无论血统（xhshow/redbook）、传输（requestUrl/Node https/curl/页面 XHR）、身份（v1/v2 分区、商业插件 cookie）如何组合；页面原生 mnsv2 签名是唯一被接受的路径（user/me 等宽松端点除外）
 - 同批修复（02acfec）：目录/文件写入全面改用 adapter API（磁盘真值，索引不同步不再报错，目录存在直接同步）；登录页 0.45 深度缩放（矮 guest 视口内显示完整二维码）；移除 COOKIE_DUMP 临时诊断
 - **M2 毕业条件全部达成**：登录 ✓ 检测 ✓ 会话保持 ✓ 取数（mnsv2 签名）✓ 渲染 ✓ 落盘 ✓ 增量去重 ✓ 限速 ✓
+
+## ADR-021 M3：媒体下载 + hash 增量 + 视频开关（2026-09-17，b8c77c4）
+
+- 图片下载到 {mediaFolder}/{note_id}/N.ext（Node https→curl 双通道、UA+Referer、512MB 上限、单图失败回退远程 URL）；正文内嵌 vault 相对路径；**视频下载默认关闭**（downloadVideos 开关，磁盘空间考量），开启时落盘 video.mp4+本地链接
+- 内容 hash 增量索引 noteIndex（sha256，源数据字段；URL 以 path 规范化入 hash——query 是易变签名 token）替代 syncedNoteIds（一次性迁移，hash="" 哨兵=对账不重写不下载，旧笔记不被触碰）；hash 相同跳过、变化重写并**原样保留旧文 AI 小节**（## 🤖 AI 摘要 至 EOF）
+- 评审 5 项修复：重写就地写（标题变才换名并删旧文，防副本堆积）；限速预算按详情请求计费（三路径一致）；下载溢出先 settle 再 destroy（防永久挂起）+ close/aborted 兜底；无后缀 URL 按 seq 复用已存在文件（防重复下载）；hash 去 query/fragment
+- 174/174 单测（+73）；真机未验证：新鲜 CDN URL 实际下载、大视频落盘、迁移后首次对账全流程（9 篇旧笔记逐篇对账，受限速约束）
