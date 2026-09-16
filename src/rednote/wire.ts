@@ -21,9 +21,10 @@ export const COLLECT_IMAGE_FORMATS = "jpg,webp,avif";
 
 /**
  * Ordered GET params for /api/sns/web/v2/note/collect/page, matching the
- * reference implementation: optional cursor -> num -> user_id ->
- * image_formats. Object insertion order IS the wire order (and the order the
- * signature content string is built with).
+ * reference implementation VERBATIM: optional cursor -> num -> user_id ->
+ * image_formats -> xsec_token (EMPTY) -> xsec_source (EMPTY). The empty
+ * xsec params are present-but-blank in the reference's requests; object
+ * insertion order IS the wire order (and the signed content string's order).
  *
  * @param userId the logged-in user's id
  * @param cursor pagination cursor ("" on the first page -> param omitted)
@@ -36,6 +37,8 @@ export function buildCollectPageParams(userId: string, cursor: string): Record<s
 	params.num = String(COLLECT_PAGE_NUM);
 	params.user_id = userId;
 	params.image_formats = COLLECT_IMAGE_FORMATS;
+	params.xsec_token = "";
+	params.xsec_source = "";
 	return params;
 }
 

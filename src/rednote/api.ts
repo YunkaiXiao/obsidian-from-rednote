@@ -37,6 +37,7 @@ import { mergeNoteCard } from "./extract";
 // (xhsSign) stays in sign.ts as a backup path — since ~2026-03 data-fetching
 // APIs reject XYS_ with {success:false}.
 import { xhsSign, xhsSignXyw, generateB1 } from "./sign";
+import { signRequest } from "./sign-ref";
 import {
 	buildCollectPageParams,
 	buildGetQueryString,
@@ -555,34 +556,23 @@ export class RedNoteSession {
 	}
 
 	/**
-	 * Signed headers for the plugin-process path: a1 comes from the extracted
-	 * cookie string, b1 from the page's localStorage (best effort, synthesized
-	 * when absent) — the same inputs xhshow/MediaCrawler use. When no a1 can be
-	 * parsed (cookie extraction failed entirely), falls back to the legacy
-	 * getSign() flow (page-cookie a1 -> local sign -> page-sign probe).
+	 * Signed headers for the plugin-process path — now produced by the
+	 * VERBATIM port of ytf606/xhs2obsidian's signing (see ./sign-ref.ts,
+	 * MIT): a redbook-lineage implementation whose signatures the XHS server
+	 * accepts, unlike our previous xhshow-derived signer (perpetual 406).
+	 * It takes the FULL cookie string and synthesizes its own fingerprint b1.
 	 */
 	private async signForNodeRequest(
 		cookieString: string,
 		method: "GET" | "POST",
 		uri: string,
 		data: Record<string, unknown> | null,
-	): Promise<RedNoteSign> {
-		const a1 = extractCookieValue(cookieString, "a1");
-		if (a1) {
-			let b1 = "";
-			try {
-				const raw = await this.eval<string>(
-					'(() => { try { return String((window.localStorage && window.localStorage.getItem("b1")) || ""); } catch (e) { return ""; } })()',
-				);
-				if (typeof raw === "string") {
-					b1 = raw;
-				}
-			} catch {
-				/* localStorage read is best effort — generateB1() covers it */
-			}
-			return xhsSign(uri, method, data, a1, b1 || generateB1());
+	): Promise<Record<string, string>> {
+		if (!cookieString) {
+			throw new SignError("无 Cookie 可用于签名（未登录或分区读取失败）");
 		}
-		return await this.getSign(method, uri, data);
+		const headers = signRequest(uri, method, cookieString, data ?? undefined);
+		return { ...headers } as Record<string, string>;
 	}
 
 	/**
@@ -765,18 +755,15 @@ export class RedNoteSession {
 			"Referer": "https://www.xiaohongshu.com/",
 			"User-Agent": EDGE_UA,
 		};
-		if (method === "POST") {
-			headers["Content-Type"] = "application/json;charset=UTF-8";
-		}
+		// The reference sends Content-Type on EVERY request (GETs included).
+		headers["Content-Type"] = "application/json;charset=UTF-8";
 		if (!opts.unsigned) {
 			const sign = await this.signForNodeRequest(cookieString, method, uri, data);
-			headers["X-S"] = sign["X-S"];
-			headers["X-T"] = sign["X-T"];
-			headers["x-s-common"] = sign["x-s-common"];
-			headers["X-B3-Traceid"] = sign["X-B3-Traceid"];
-			// x-xray-traceid: hex((epochMs << 23) | seq) + 16 random hex chars
-			// (reference sign-manager format).
-			headers["x-xray-traceid"] = newXrayTraceid(Date.now());
+			headers["x-s"] = sign["x-s"] ?? "";
+			headers["x-t"] = sign["x-t"] ?? "";
+			headers["x-s-common"] = sign["x-s-common"] ?? "";
+			headers["x-b3-traceid"] = sign["x-b3-traceid"] ?? "";
+			headers["x-xray-traceid"] = sign["x-xray-traceid"] ?? "";
 			// Optional: captured from the page (see installPageRecorder). When
 			// interception fails, the request goes out WITHOUT this header.
 			const rap = await this.readRapParam();

@@ -18,7 +18,7 @@ import { xhsQueryEscape } from "../src/rednote/sign";
 describe("buildCollectPageParams (query order per reference sign-manager)", () => {
 	it("orders cursor -> num -> user_id -> image_formats on paged requests", () => {
 		const p = buildCollectPageParams("5a89c2c39e52e17b3b7f9403c", "abc123");
-		expect(Object.keys(p)).toEqual(["cursor", "num", "user_id", "image_formats"]);
+		expect(Object.keys(p)).toEqual(["cursor", "num", "user_id", "image_formats", "xsec_token", "xsec_source"]);
 		expect(p["cursor"]).toBe("abc123");
 		expect(p["num"]).toBe("30");
 		expect(p["user_id"]).toBe("5a89c2c39e52e17b3b7f9403c");
@@ -27,7 +27,7 @@ describe("buildCollectPageParams (query order per reference sign-manager)", () =
 
 	it("omits cursor on the first page (cursor=\"\" -> param absent)", () => {
 		const p = buildCollectPageParams("u1", "");
-		expect(Object.keys(p)).toEqual(["num", "user_id", "image_formats"]);
+		expect(Object.keys(p)).toEqual(["num", "user_id", "image_formats", "xsec_token", "xsec_source"]);
 	});
 });
 
@@ -37,13 +37,13 @@ describe("buildGetQueryString (signed content string == URL query)", () => {
 			buildCollectPageParams("5a89c2c39e52e17b3b7f9403c", "abc123"),
 		);
 		expect(qs).toBe(
-			"cursor=abc123&num=30&user_id=5a89c2c39e52e17b3b7f9403c&image_formats=jpg,webp,avif",
+			"cursor=abc123&num=30&user_id=5a89c2c39e52e17b3b7f9403c&image_formats=jpg,webp,avif&xsec_token=&xsec_source=",
 		);
 	});
 
 	it("escapes reserved chars the way the signature content string does", () => {
 		const qs = buildGetQueryString(buildCollectPageParams("u/1+2", "c=1"));
-		expect(qs).toBe("cursor=c%3D1&num=30&user_id=u%2F1%2B2&image_formats=jpg,webp,avif");
+		expect(qs).toBe("cursor=c%3D1&num=30&user_id=u%2F1%2B2&image_formats=jpg,webp,avif&xsec_token=&xsec_source=");
 	});
 
 	it("uses xhsQueryEscape verbatim for every value", () => {
