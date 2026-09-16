@@ -658,6 +658,23 @@ export class RedNoteSession {
 	 */
 	private rapParamCache: string | null = null;
 
+	/**
+	 * Full header map captured from the PAGE'S OWN successful edith requests
+	 * (Service-Tag, c_device_id, …). Used to mirror the page's header set on
+	 * our outbound requests — the server 406s requests missing these.
+	 */
+	async readPageHeaders(): Promise<Record<string, string>> {
+		try {
+			const raw = await this.eval<string>(
+				'(() => { try { return JSON.stringify(window.__pullHdrs || {}); } catch (e) { return "{}"; } })()',
+			);
+			const parsed = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+			return parsed && typeof parsed === "object" ? parsed : {};
+		} catch {
+			return {};
+		}
+	}
+
 	async readRapParam(): Promise<string> {
 		if (this.rapParamCache !== null) {
 			return this.rapParamCache;
@@ -909,6 +926,29 @@ export class RedNoteSession {
 			if (rap) {
 				headers["x-rap-param"] = rap;
 			}
+			// MIRROR the page's own header set (Service-Tag, c_device_id, …)
+			// captured from its successful edith requests — the server 406s
+			// requests missing these. Skip hop-by-hop, transport-managed and
+			// per-request signature headers (ours are freshly computed).
+			const pageHdrs = await this.readPageHeaders();
+			const skip = new Set([
+				"cookie", "host", "content-length", "connection", "accept",
+				"accept-encoding", "content-type", "origin", "referer",
+				"user-agent", "x-s", "x-t", "x-s-common", "x-b3-traceid",
+				"x-xray-traceid", "x-rap-param",
+			]);
+			let mirrored = 0;
+			for (const [k, v] of Object.entries(pageHdrs)) {
+				const lk = k.toLowerCase();
+				if (skip.has(lk) || !v || headers[k] !== undefined) {
+					continue;
+				}
+				headers[k] = v;
+				mirrored += 1;
+			}
+			if (mirrored > 0) {
+				this.log(`${method} ${uri.slice(0, 40)}：镜像页面头 ×${mirrored}`);
+			}
 		}
 
 		// Build the full URL and body. For GET, the query string MUST be
@@ -1116,7 +1156,7 @@ export class RedNoteSession {
 					try {
 						if (this.__pullUrl && this.__pullUrl.indexOf("edith.xiaohongshu.com") >= 0) {
 							if (!window.__pullHdrs) { window.__pullHdrs = {}; }
-							if (!(n in window.__pullHdrs)) { window.__pullHdrs[n] = String(v).slice(0, 18); }
+							if (!(n in window.__pullHdrs)) { window.__pullHdrs[n] = String(v).slice(0, 200); }
 						}
 					} catch (err) {}
 					return osh.apply(this, arguments);
@@ -1168,7 +1208,7 @@ export class RedNoteSession {
 		// GUEST_VIEW_MANAGER_CALL error. Every access is wrapped so the eval
 		// always resolves with a JSON summary.
 		const code = `(() => {
-			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent", pageReqs: "", pageHdrs: "" };
+			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent", pageReqs: "", pageHdrs: "", pageHdrMap: "" };
 			// Page-request recorder: hook fetch ONCE and remember the status of
 			// every edith API call the PAGE ITSELF makes. If the page's own
 			// requests also get 406, the block is webview-session-wide (device/
@@ -1196,7 +1236,8 @@ export class RedNoteSession {
 				out.pageHdrs = Object.keys(window.__pullHdrs || {})
 					.map(function (k) { return k + "=" + window.__pullHdrs[k]; })
 					.join(" , ")
-					.slice(0, 200);
+					.slice(0, 500);
+				out.pageHdrMap = JSON.stringify(window.__pullHdrs || {});
 			} catch (e) { out.pageReqs = "HOOK_ERR"; }
 			try { out.cookieA1 = /(?:^|; )a1=/.test(document.cookie); } catch (e) {}
 			try {
@@ -1231,12 +1272,16 @@ export class RedNoteSession {
 						loggedIn?: string;
 						pageReqs?: string;
 						pageHdrs?: string;
+						pageHdrMap?: string;
 					})
 				: null;
 			if (!p) {
 				return { ok: false, info: "页面探测无返回" };
 			}
 			const stateKeys = (p.stateKeys ?? "").slice(0, 80);
+			if (p.pageHdrMap && p.pageHdrMap !== "{}") {
+				this.log(`页面成功请求头全集：${p.pageHdrMap.slice(0, 600)}`);
+			}
 			if (p.pageHdrs) {
 				this.log(`页面成功请求的头样例：${p.pageHdrs}`);
 			}
