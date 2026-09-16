@@ -526,6 +526,11 @@ export class RedNoteSession {
 		if (this.rapParamCache !== null) {
 			return this.rapParamCache;
 		}
+		// The recorder (which carries the x-rap-param hooks + warmup) must be
+		// installed on the CURRENT webview element — after a destroy/reclaim
+		// cycle a fresh element exists without any hooks, and the warmup would
+		// fire into an unhooked page (observed: 10s timeout, no capture).
+		await this.installPageRecorder();
 		const deadline = Date.now() + 10_000;
 		while (Date.now() < deadline) {
 			try {
@@ -1196,15 +1201,23 @@ export class RedNoteSession {
 				const out = { uid: "" };
 				try {
 					const u = (window.__INITIAL_STATE__ || {}).user || {};
+					// SSR values are Vue ref wrappers (observed keys: __v_isRef,
+					// _rawValue, _value) — unwrap before reading fields.
+					const unref = (o) => (!o || typeof o !== "object") ? o : (o._rawValue !== undefined ? o._rawValue : (o.value !== undefined ? o.value : o));
+					const ui = unref(u.userInfo);
+					const upd = unref(u.userPageData);
 					const cands = [
-						u.userInfo && (u.userInfo.user_id || u.userInfo.userId),
-						u.userPageData && (u.userPageData.user_id || u.userPageData.userId),
+						ui && (ui.user_id || ui.userId),
+						upd && (upd.user_id || upd.userId),
 						u.user_id,
 					];
 					for (const c of cands) {
 						if (c != null && String(c).length > 0) { out.uid = String(c); break; }
 					}
-					if (!out.uid) { out.uid = "MISS:" + Object.keys(u.userInfo || {}).slice(0, 12).join(","); }
+					if (!out.uid) {
+						const uk = Object.keys(ui || {}).slice(0, 14).join(",");
+						out.uid = "MISS:" + (uk || Object.keys(u.userInfo || {}).slice(0, 12).join(","));
+					}
 				} catch (e) { out.uid = "THROW:" + String(e).slice(0, 50); }
 				return JSON.stringify(out);
 			})()`;
