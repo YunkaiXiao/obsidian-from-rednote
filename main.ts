@@ -39,6 +39,9 @@ export interface RedNoteSyncSettings {
 	rateLimitWindowMinutes: number;
 	/** Rate limit: persisted window budget state (survives restarts). */
 	rateLimitState: RateLimitState | null;
+	/** Last captured header set of the page's own successful edith requests
+	 * (Service-Tag, c_device_id …) — mirrored onto our outbound requests. */
+	pageHeaders: Record<string, string> | null;
 }
 
 const DEFAULT_SETTINGS: RedNoteSyncSettings = {
@@ -55,6 +58,7 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	rateLimitMaxNotes: 20,
 	rateLimitWindowMinutes: 10,
 	rateLimitState: null,
+	pageHeaders: null,
 };
 
 /** XHS publish/collect times are rendered in +08:00 (see extract.ts). */
@@ -97,6 +101,15 @@ export default class RedNoteSyncPlugin extends Plugin {
 					}
 				};
 				this.session.log("插件加载，调试日志已启用（fs 直写）");
+		// Persist the page's captured header set so mirroring survives
+		// restarts (a fresh page context starts with an empty capture).
+		this.session.pageHeaderStore = {
+			get: () => this.settings.pageHeaders ?? {},
+			set: (m) => {
+				this.settings.pageHeaders = m;
+				void this.saveSettings();
+			},
+		};
 		this.session.log(`分区拦截状态：${cleanPartitionStatus.value}`);
 			} catch (e) {
 				console.warn("[pull-rednote] fs logger init failed:", e);

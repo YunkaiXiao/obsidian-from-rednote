@@ -669,9 +669,24 @@ export class RedNoteSession {
 				'(() => { try { return JSON.stringify(window.__pullHdrs || {}); } catch (e) { return "{}"; } })()',
 			);
 			const parsed = raw ? (JSON.parse(raw) as Record<string, string>) : {};
-			return parsed && typeof parsed === "object" ? parsed : {};
+			const live = parsed && typeof parsed === "object" ? parsed : {};
+			// A live capture with a couple of headers beats nothing: persist it
+			// so fresh sessions (whose page hasn't fired any captured request
+			// yet) still mirror the page's header set.
+			if (Object.keys(live).length >= 3 && this.pageHeaderStore) {
+				try {
+					this.pageHeaderStore.set(live);
+				} catch {
+					/* persistence is best-effort */
+				}
+			}
+			if (Object.keys(live).length >= 3) {
+				return live;
+			}
+			const stored = this.pageHeaderStore?.get() ?? {};
+			return Object.keys(stored).length >= 3 ? stored : live;
 		} catch {
-			return {};
+			return this.pageHeaderStore?.get() ?? {};
 		}
 	}
 
@@ -1307,6 +1322,17 @@ export class RedNoteSession {
 	 */
 	/** Optional debug sink (main.ts wires this to debug.log in the plugin dir). */
 	logger: ((line: string) => void) | null = null;
+	/**
+	 * Persistent fallback for the page's captured header set (Service-Tag,
+	 * c_device_id …). The LIVE capture is empty until the page happens to
+	 * make its own edith requests (can take a minute+); persisting the last
+	 * good capture keeps mirroring working on fresh sessions. Wired by main
+	 * to settings + saveData, and seeded back on load.
+	 */
+	pageHeaderStore: {
+		get: () => Record<string, string>;
+		set: (m: Record<string, string>) => void;
+	} | null = null;
 
 	log(line: string): void {
 		const ts = new Date().toISOString().slice(11, 23);
