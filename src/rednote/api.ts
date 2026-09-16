@@ -140,6 +140,67 @@ type WebviewEl = HTMLElement & {
 export { isXhsHost } from "./wire";
 
 /**
+ * Spawned-curl transport (last-resort fallback when in-process Node https is
+ * 406-d by the server): the same request via a spawned curl process was
+ * verified to return 200 repeatedly — the blocker discriminates something
+ * about the in-process network stack, not the request itself.
+ */
+function curlTransport(
+	url: string,
+	method: string,
+	headers: Record<string, string>,
+	body?: string,
+): Promise<{ status: number; text: string; serverHeaders: string }> {
+	return new Promise((resolve) => {
+		try {
+			const reqquire = (window as unknown as { require?: (m: string) => unknown }).require;
+			const cp = reqquire?.("child_process") as
+				| { execFile?: (cmd: string, args: string[], opts: unknown, cb: (err: unknown, stdout: string) => void) => unknown }
+				| undefined;
+			if (!cp?.execFile) {
+				resolve({ status: -1, text: "", serverHeaders: "child_process 不可用" });
+				return;
+			}
+			const args = [
+				"-s",
+				"-o",
+				"-",
+				"-w",
+				"\n__PULLHTTP__%{http_code}",
+				"--max-time",
+				"20",
+				"-X",
+				method,
+				url,
+			];
+			for (const [k, v] of Object.entries(headers)) {
+				args.push("-H", `${k}: ${v}`);
+			}
+			if (body) {
+				args.push("-d", body);
+			}
+			cp.execFile(
+				"curl",
+				args,
+				{ timeout: 30_000, maxBuffer: 20 * 1024 * 1024, encoding: "utf8" },
+				(err: unknown, stdout: string) => {
+					if (err) {
+						resolve({ status: -1, text: "", serverHeaders: `exec err: ${String(err).slice(0, 80)}` });
+						return;
+					}
+					const m = stdout.match(/__PULLHTTP__(\d+)/);
+					const status = m ? Number(m[1]) : -1;
+					const text = stdout.split("\n__PULLHTTP__")[0] ?? "";
+					resolve({ status, text, serverHeaders: "" });
+				},
+			);
+		} catch (e) {
+			resolve({ status: -1, text: "", serverHeaders: String(e).slice(0, 80) });
+		}
+	});
+}
+
+/**
  * Plain Node HTTPS JSON request (desktop plugin has Node access). Replaces
  * obsidian requestUrl as the API transport: standalone probing proved the
  * identical header set + signature gets 200 via a plain HTTPS client while
@@ -854,8 +915,23 @@ export class RedNoteSession {
 			// TRANSPORT: raw Node https, NOT obsidian requestUrl — a standalone
 			// probe proved identical headers+signature get HTTP 200 via a plain
 			// HTTPS client while requestUrl gets 406 (it stamps its own
-			// request identity, which XHS rejects).
-			const r = await nodeHttpsJson(fullUrl, method, headers, body);
+			// request identity, which XHS rejects). If the in-process Node
+			// stack still gets 406 (Obsidian-process environment difference,
+			// under investigation), fall back to a spawned curl — the same
+			// request via curl was verified to return 200 repeatedly.
+			let r = await nodeHttpsJson(fullUrl, method, headers, body);
+			if (r.status === 406) {
+				this.log(`${reqTag} -> 406 (Node https)，尝试 curl 兜底`);
+				const c = await curlTransport(fullUrl, method, headers, body);
+				if (c.status > 0 && c.status !== 406) {
+					this.log(`${reqTag} -> curl 兜底生效 HTTP ${c.status}`);
+					r = c;
+				} else {
+					this.log(
+						`${reqTag} -> curl 兜底仍 ${c.status}（服务端头：${c.serverHeaders}）`,
+					);
+				}
+			}
 			let json: Record<string, unknown> | null = null;
 			try {
 				json = JSON.parse(r.text) as Record<string, unknown> | null;
