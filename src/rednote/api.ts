@@ -169,6 +169,12 @@ function curlTransport(
 				"\n__PULLHTTP__%{http_code}",
 				"--max-time",
 				"20",
+				// Force-direct: the parent (Obsidian) process carries proxy env
+				// vars that a spawned curl would otherwise HONOR — the same
+				// curl binary returns 200 standalone (no env) and 406 when
+				// spawned from Obsidian. --noproxy makes env proxies moot.
+				"--noproxy",
+				"*",
 				"-X",
 				method,
 				url,
@@ -228,6 +234,9 @@ function nodeHttpsJson(
 					method,
 					headers,
 					timeout: 20_000,
+					// Fresh per-request agent: never inherit any env/global
+					// proxy agent the host process may have configured.
+					agent: false,
 				},
 				(res) => {
 					let d = "";
@@ -921,7 +930,14 @@ export class RedNoteSession {
 			// request via curl was verified to return 200 repeatedly.
 			let r = await nodeHttpsJson(fullUrl, method, headers, body);
 			if (r.status === 406) {
-				this.log(`${reqTag} -> 406 (Node https)，尝试 curl 兜底`);
+				const envP = (window as unknown as { process?: { env?: Record<string, string | undefined> } })
+					.process?.env ?? {};
+				const envRelay = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY"]
+					.filter((k) => envP[k])
+					.join(",");
+				this.log(
+					`${reqTag} -> 406 (Node https)，尝试 curl 兜底（进程代理env：${envRelay || "无"}）`,
+				);
 				const c = await curlTransport(fullUrl, method, headers, body);
 				if (c.status > 0 && c.status !== 406) {
 					this.log(`${reqTag} -> curl 兜底生效 HTTP ${c.status}`);
