@@ -7,7 +7,7 @@
 
 import { App, Notice, Plugin, PluginSettingTab, Setting, ToggleComponent, TextComponent } from "obsidian";
 
-import { RedNoteSession } from "./src/rednote/api";
+import { RedNoteSession, cleanPartitionStatus } from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginView, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
@@ -97,6 +97,7 @@ export default class RedNoteSyncPlugin extends Plugin {
 					}
 				};
 				this.session.log("插件加载，调试日志已启用（fs 直写）");
+		this.session.log(`分区拦截状态：${cleanPartitionStatus.value}`);
 			} catch (e) {
 				console.warn("[pull-rednote] fs logger init failed:", e);
 			}

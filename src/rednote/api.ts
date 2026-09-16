@@ -59,7 +59,10 @@ const CHROME_UA =
  * Must run before the first ensureWebviewElement() (called from the
  * RedNoteSession constructor).
  */
+export const cleanPartitionStatus = { value: "未执行" };
+
 export function initCleanPartition(log?: (line: string) => void): void {
+	cleanPartitionStatus.value = "执行中";
 	try {
 		const req = (window as unknown as { require?: (m: string) => unknown }).require;
 		const electron = req?.("electron") as
@@ -68,6 +71,7 @@ export function initCleanPartition(log?: (line: string) => void): void {
 		const ipc = electron?.ipcRenderer;
 		const origSend = ipc?.send?.bind(ipc);
 		if (!ipc || !origSend || (ipc as unknown as { __pullRednotePatched?: boolean }).__pullRednotePatched) {
+			cleanPartitionStatus.value = "跳过（ipcRenderer.send 不可用或已包装过）";
 			return;
 		}
 		(ipc as unknown as { __pullRednotePatched?: boolean }).__pullRednotePatched = true;
@@ -77,6 +81,7 @@ export function initCleanPartition(log?: (line: string) => void): void {
 					channel === "create-browser-session" &&
 					JSON.stringify(args).includes(WEBVIEW_PARTITION)
 				) {
+					cleanPartitionStatus.value = "已拦截 create-browser-session（钩子未安装）";
 					log?.("已拦截 create-browser-session：分区保持无钩子（sec-* 头不再被删）");
 					return;
 				}
@@ -85,8 +90,10 @@ export function initCleanPartition(log?: (line: string) => void): void {
 			}
 			origSend(channel, ...args);
 		};
+		cleanPartitionStatus.value = "已包装 ipcRenderer.send（等待 create-browser-session）";
 		log?.("initCleanPartition：ipcRenderer.send 已包装");
 	} catch (e) {
+		cleanPartitionStatus.value = `失败：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`;
 		log?.(`initCleanPartition 失败（钩子可能仍会安装）：${e instanceof Error ? e.message : String(e)}`);
 	}
 }
@@ -702,7 +709,32 @@ export class RedNoteSession {
 		// GUEST_VIEW_MANAGER_CALL error. Every access is wrapped so the eval
 		// always resolves with a JSON summary.
 		const code = `(() => {
-			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent" };
+			const out = { hasUserData: false, userKeys: "", cookieA1: false, stateKeys: "PROBE_ERROR", loggedIn: "absent", pageReqs: "" };
+			// Page-request recorder: hook fetch ONCE and remember the status of
+			// every edith API call the PAGE ITSELF makes. If the page's own
+			// requests also get 406, the block is webview-session-wide (device/
+			// fingerprint level); if they succeed, only OUR constructed
+			// requests differ. This single signal discriminates the two.
+			try {
+				if (!window.__pullHooked) {
+					window.__pullHooked = true;
+					window.__pullReqs = [];
+					const of = window.fetch;
+					window.fetch = function () {
+						const a = arguments;
+						const url = String(a[0]);
+						if (url.indexOf("edith.xiaohongshu.com") >= 0) {
+							const e = { u: url.slice(0, 90), s: 0 };
+							window.__pullReqs.push(e);
+							return of.apply(this, a).then(function (r) { e.s = r.status; return r; });
+						}
+						return of.apply(this, a);
+					};
+				}
+				out.pageReqs = (window.__pullReqs || []).slice(-6)
+					.map(function (e) { return (e.s || "?") + "<" + e.u.slice(28, 62) + ">"; })
+					.join(" ; ");
+			} catch (e) { out.pageReqs = "HOOK_ERR"; }
 			try { out.cookieA1 = /(?:^|; )a1=/.test(document.cookie); } catch (e) {}
 			try {
 				const st = window.__INITIAL_STATE__ || {};
@@ -734,16 +766,19 @@ export class RedNoteSession {
 						cookieA1?: boolean;
 						stateKeys?: string;
 						loggedIn?: string;
+						pageReqs?: string;
 					})
 				: null;
 			if (!p) {
 				return { ok: false, info: "页面探测无返回" };
 			}
 			const stateKeys = (p.stateKeys ?? "").slice(0, 80);
+			this.log(`页面自身请求记录：${p.pageReqs || "（暂无）"}`);
 			const info =
 				`页面侧 loggedIn=${p.loggedIn ?? "?"}，INITIAL_STATE.user=${p.userKeys || "无"}` +
 				`，a1=${p.cookieA1 ? "有" : "无"}` +
-				`，state keys=${stateKeys || "无"}`;
+				`，state keys=${stateKeys || "无"}` +
+				`，页面请求=${p.pageReqs ? p.pageReqs.slice(0, 120) : "无"}`;
 			// loggedIn === true is the authoritative signal; fall back to
 			// hasUserData only when the field is absent (unexpected shape).
 			const ok = p.loggedIn === "true" || (p.loggedIn !== "false" && Boolean(p.hasUserData));
