@@ -987,7 +987,40 @@ export class RedNoteSession {
 	 * Derived from selfinfo.
 	 */
 	async getSelfUserId(): Promise<string> {
-		// SIGNED ONLY (unsigned selfinfo is a guaranteed 406 / risk noise).
+		// PRIMARY: read the user id from the PAGE's SSR state — zero API
+		// requests. selfinfo is the endpoint we hammered for hours during
+		// debugging and it now returns 406 unconditionally for this session,
+		// but the logged-in page already carries the user id in
+		// __INITIAL_STATE__.user (userInfo / userPageData).
+		try {
+			const code = `(() => {
+				const out = { uid: "" };
+				try {
+					const u = (window.__INITIAL_STATE__ || {}).user || {};
+					const cands = [
+						u.userInfo && (u.userInfo.user_id || u.userInfo.userId),
+						u.userPageData && (u.userPageData.user_id || u.userPageData.userId),
+						u.user_id,
+					];
+					for (const c of cands) {
+						if (c != null && String(c).length > 0) { out.uid = String(c); break; }
+					}
+					if (!out.uid) { out.uid = "MISS:" + Object.keys(u.userInfo || {}).slice(0, 12).join(","); }
+				} catch (e) { out.uid = "THROW:" + String(e).slice(0, 50); }
+				return JSON.stringify(out);
+			})()`;
+			const raw = await this.eval<string>(code);
+			const p = raw ? (JSON.parse(raw) as { uid?: string }) : null;
+			const uid = p?.uid ?? "";
+			if (uid && !uid.startsWith("MISS:") && !uid.startsWith("THROW:")) {
+				this.log(`getSelfUserId：从页面 SSR 状态取得 user_id=${uid.slice(0, 8)}…`);
+				return uid;
+			}
+			this.log(`getSelfUserId：页面 SSR 未取到 user_id（${uid.slice(0, 80)}），回退 selfinfo 接口`);
+		} catch (e) {
+			this.log(`getSelfUserId：页面读取失败，回退 selfinfo 接口：${e instanceof Error ? e.message.slice(0, 80) : String(e).slice(0, 80)}`);
+		}
+		// FALLBACK: signed selfinfo (SIGNED ONLY — unsigned is guaranteed 406).
 		let data: Record<string, unknown>;
 		try {
 			data = await this.request("GET", "/api/sns/web/v1/user/selfinfo", {}, {});
@@ -995,10 +1028,6 @@ export class RedNoteSession {
 			this.log(`getSelfUserId 请求失败：${e instanceof Error ? e.message.slice(0, 100) : String(e).slice(0, 100)}`);
 			return "";
 		}
-		// Tolerant extraction across known/possible 2026 envelope shapes; when
-		// nothing matches, log the REAL payload shape so the next round can
-		// adapt precisely (this used to silently return "" and the sync threw
-		// NotLoggedInError 3ms after a successful HTTP 200).
 		const result = (data?.result ?? data) as Record<string, unknown> | undefined;
 		const basic = (result?.basic_info ?? result) as Record<string, unknown> | undefined;
 		const candidates = [basic?.user_id, result?.user_id, data?.user_id];
