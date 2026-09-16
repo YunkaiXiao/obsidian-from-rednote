@@ -189,6 +189,9 @@ export default class RedNoteSyncPlugin extends Plugin {
 			new Notice("同步正在进行中，请稍候");
 			return;
 		}
+		// Immediate feedback: the login gates + retries below can take tens of
+		// seconds before the first progress notice — show activity at once.
+		new Notice("正在同步小红书收藏…");
 
 		// Gate 1: login. The persisted flag can be STALE (a historical
 		// misreport once flipped it false while the session was alive), so

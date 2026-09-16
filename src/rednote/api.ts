@@ -32,12 +32,64 @@ import { xhsSignXyw, generateB1, xhsQueryEscape } from "./sign";
 
 /** The partition isolates this session from Obsidian's default browser session. */
 const WEBVIEW_PARTITION = "persist:rednote-sync";
-// NOTE: no useragent override on purpose. Per community analysis of
-// obsidian.asar 1.13.7, Obsidian installs a session.webRequest hook per
-// partition that rewrites the User-Agent header AFTER the webview attribute
-// would apply, so the attribute is unreliable here anyway (see
-// webview-ua-override plugin write-up). Surfing (reference implementation)
-// sets no useragent either. Fewer moving parts, one less crash variable.
+/**
+ * Chrome UA matching the user's real local Chrome build. With the clean-
+ * partition IPC swallow (see initCleanPartition) this attribute WORKS: the
+ * sec-fetch-dest / sec-ch-ua headers survive and XHS no longer 406s the
+ * requests (Obsidian's per-partition webRequest hook deletes those headers
+ * and rewrites the UA — the root cause of the permanent HTTP 406s).
+ */
+const CHROME_UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+	"Chrome/153.0.0.0 Safari/537.36";
+
+/**
+ * Keep our webview partition FREE of Obsidian's per-partition webRequest hooks.
+ *
+ * Community finding (Bryan Monge, forum thread 117394; engineered by the
+ * webview-ua-override plugin): Obsidian's main process installs a
+ * session.webRequest.onBeforeSendHeaders hook on every partition named by a
+ * "create-browser-session" IPC message; that hook DELETES sec-fetch-dest /
+ * sec-ch-ua and rewrites the UA — XHS responds HTTP 406 to such requests,
+ * permanently (observed: a fresh session got 200 early, then 406 forever
+ * after the hook landed, while plain Chrome on the same IP kept working).
+ *
+ * A partition the IPC never names never gets the hook. So we swallow the
+ * create-browser-session message for OUR partition before any webview exists.
+ * Must run before the first ensureWebviewElement() (called from the
+ * RedNoteSession constructor).
+ */
+export function initCleanPartition(log?: (line: string) => void): void {
+	try {
+		const req = (window as unknown as { require?: (m: string) => unknown }).require;
+		const electron = req?.("electron") as
+			| { ipcRenderer?: { send?: (channel: string, ...args: unknown[]) => void } }
+			| undefined;
+		const ipc = electron?.ipcRenderer;
+		const origSend = ipc?.send?.bind(ipc);
+		if (!ipc || !origSend || (ipc as unknown as { __pullRednotePatched?: boolean }).__pullRednotePatched) {
+			return;
+		}
+		(ipc as unknown as { __pullRednotePatched?: boolean }).__pullRednotePatched = true;
+		ipc.send = (channel: string, ...args: unknown[]): void => {
+			try {
+				if (
+					channel === "create-browser-session" &&
+					JSON.stringify(args).includes(WEBVIEW_PARTITION)
+				) {
+					log?.("已拦截 create-browser-session：分区保持无钩子（sec-* 头不再被删）");
+					return;
+				}
+			} catch {
+				/* fall through to the original send */
+			}
+			origSend(channel, ...args);
+		};
+		log?.("initCleanPartition：ipcRenderer.send 已包装");
+	} catch (e) {
+		log?.(`initCleanPartition 失败（钩子可能仍会安装）：${e instanceof Error ? e.message : String(e)}`);
+	}
+}
 
 const HOST = "https://edith.xiaohongshu.com";
 const INDEX_URL = "https://www.xiaohongshu.com";
@@ -107,6 +159,12 @@ export class RedNoteSession {
 	private webview: WebviewEl | null = null;
 	private readyPromise: Promise<void> | null = null;
 
+	constructor() {
+		// MUST happen before the first webview creation so our partition is
+		// never named by create-browser-session (see initCleanPartition).
+		initCleanPartition((line) => this.log(line));
+	}
+
 	/**
 	 * Ensure a resident webview exists and is loaded with the XHS homepage.
 	 * Idempotent: returns the existing (ready) webview if one is present.
@@ -154,13 +212,20 @@ export class RedNoteSession {
 		// (el.src = …, el.partition = …) is NOT reflected to attributes in this
 		// Electron build, so the navigation never started and the webview stayed
 		// on about:blank — the all-white login modal. Always use setAttribute.
-		// partition MUST be set before attach/src: it selects the persistent
-		// session the login cookies will live in.
+		// ORDER (per the webview-ua-override write-up): useragent BEFORE
+		// partition, both BEFORE attach/src — with the clean partition the
+		// attribute now actually applies and XHS sees a genuine Chrome UA.
+		el.setAttribute("useragent", CHROME_UA);
 		el.setAttribute("partition", WEBVIEW_PARTITION);
 		// NOTE: allowpopups is intentionally NOT set. Electron treats boolean
 		// webview attributes by PRESENCE (any value, including "false", means
 		// enabled), so setAttribute("allowpopups", "false") would have been
 		// inverted. Absent = popups disabled, which is what we want.
+		// The clean (unhooked) partition also skips Obsidian's session-level
+		// permission sandbox — deny everything at the element level instead.
+		el.addEventListener("permissionrequest", (e: Event) => {
+			(e as Event & { preventDefault?: () => void }).preventDefault?.();
+		});
 		// Adaptive size: cap to the host window so the login page always fits
 		// (small Obsidian windows used to crop the QR code area).
 		el.style.width = "min(480px, 85vw)";
