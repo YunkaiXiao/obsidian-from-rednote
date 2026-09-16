@@ -489,6 +489,10 @@ export class RedNoteSession {
 					url: "https://www.xiaohongshu.com",
 				});
 				if (Array.isArray(cookies) && cookies.length > 0) {
+					const names = cookies.map((c) => String(c.name));
+					this.log(
+						`getCookieString：分区取得 ${cookies.length} 个 cookie，web_session=${names.includes("web_session") ? "有" : "无"}，a1=${names.includes("a1") ? "有" : "无"}`,
+					);
 					return joinCookies(
 						cookies.map((c) => ({ name: String(c.name), value: String(c.value) })),
 					);

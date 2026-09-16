@@ -66,7 +66,17 @@ async function ensureFolder(vault: Vault, folderPath: string): Promise<TFolder> 
 		const childPath = current.path ? `${current.path}/${part}` : part;
 		let child = vault.getAbstractFileByPath(childPath);
 		if (!child) {
-			child = await vault.createFolder(childPath);
+			try {
+				child = await vault.createFolder(childPath);
+			} catch {
+				// Tolerate races with the vault index (e.g. the folder was just
+				// created or deleted externally): re-read, then fail only if it
+				// truly does not exist as a folder.
+				child = vault.getAbstractFileByPath(childPath);
+				if (!child) {
+					throw new Error(`无法创建目录 ${childPath}`);
+				}
+			}
 		}
 		current = child as TFolder;
 	}
