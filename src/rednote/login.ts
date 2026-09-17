@@ -170,12 +170,22 @@ export class RedNoteLoginModal extends Modal {
 	 */
 	private rebuildWithoutPreload(): void {
 		this.session.log(
-			"preload 回退：did-fail-load 疑似 webpreferences 被拒，重建不带 preload 的登录 webview",
+			"preload 回退：did-fail-load 疑似 webpreferences 被拒，延迟重建不带 preload 的登录 webview",
 		);
 		this.detachStatus();
-		this.wvEl?.remove();
+		// DEFERRED out of the did-fail-load event stack: removing a webview
+		// inside an event callback crashes the host (0x80000003 @ 0x6ca9a6f —
+		// the same CHECK assert as the M2 modal-reparent crash).
+		const dead = this.wvEl;
 		this.wvEl = null;
-		this.mountWebView(false);
+		window.setTimeout(() => {
+			try {
+				dead?.remove();
+			} catch {
+				/* already detached */
+			}
+			this.mountWebView(false);
+		}, 50);
 	}
 
 	onClose(): void {
