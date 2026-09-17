@@ -62,7 +62,7 @@ import {
 /** The partition isolates this session from Obsidian's default browser session.
  * SHARED with the login modal's fresh webview (RedNoteLoginModal) — the shared
  * cookie store is what makes a login there instantly visible here. */
-export const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — the v1 partition's a1 got server-flagged after 2 days of debug traffic
+export const WEBVIEW_PARTITION = "persist:rednote-sync-v3"; // v3: the v2 partition's cached site-instance inherited a 140px guest viewport from the display:none era — a fresh partition gets clean renderer processes
 /**
  * Chrome UA matching the user's real local Chrome build. With the clean-
  * partition IPC swallow (see initCleanPartition) this attribute WORKS: the
