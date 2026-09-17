@@ -128,40 +128,37 @@ export class RedNoteLoginModal extends Modal {
 		const wv = document.createElement("webview");
 		this.preloadApplied = false;
 		this.loadedOnce = false;
-		wv.setAttribute("useragent", CHROME_UA);
+		// EXACT commercial-plugin attribute order (deobfuscated verbatim):
+		//   src FIRST, appendChild LAST. Our previous order (mount-then-src —
+		// a white-screen-era workaround) attached the guest while the element
+		// was still src-less, and the guest viewport stuck at ~140px through
+		// every later fix (container/CSS/UA/preload/partition). Setting src
+		// before attach lets the guest attach with the navigation already
+		// pending at the element's full size.
+		wv.setAttribute("src", INDEX_URL);
 		wv.setAttribute("partition", WEBVIEW_PARTITION);
+		wv.setAttribute(
+			"style",
+			`width:100%;height:${LOGIN_WEBVIEW_HEIGHT_PX}px;border:1px solid var(--background-modifier-border);border-radius:4px;`,
+		);
+		wv.setAttribute("useragent", CHROME_UA);
+		// Role marker: keeps the session's partition-scoped reclaim query from
+		// ever adopting THIS element as the sign webview (see api.ts).
+		wv.setAttribute("data-pull-role", "login");
 		const preloadUrl = this.session.webviewPreloadUrl;
 		this.preloadApplied = withPreload && preloadUrl != null;
 		if (this.preloadApplied && preloadUrl) {
 			wv.setAttribute("webpreferences", `preload=${preloadUrl}`);
 		}
-		// Role marker: keeps the session's partition-scoped reclaim query from
-		// ever adopting THIS element as the sign webview (see api.ts).
-		wv.setAttribute("data-pull-role", "login");
-		// The commercial plugin's fixed sizing, hardened against Obsidian's own
-		// app.css rule `.webviewer-content webview { flex-grow:1; width:100% }`
-		// (NO height — inside a flex chain an inline height gets eaten and the
-		// element collapses to content height ≈ 140px, the long "short strip"
-		// saga). !important inline beats any stylesheet; the stage also gets
-		// an explicit height so no flex sizing of the element is ever needed.
-		wv.style.cssText =
-			`width:100% !important;height:${LOGIN_WEBVIEW_HEIGHT_PX}px !important;` +
-			`min-height:${LOGIN_WEBVIEW_HEIGHT_PX}px !important;` +
-			`display:block !important;border:none;`;
 		// Same element-level deny as the sign webview: our clean partition is
 		// outside Obsidian's per-session permission sandbox.
 		wv.addEventListener("permissionrequest", (e: Event) => {
 			(e as Event & { preventDefault?: () => void }).preventDefault?.();
 		});
 
-		// Mount into the VISIBLE modal content first; only then start the
-		// navigation, so the guest attaches at the final element size
-		// (100% × 520px).
+		this.attachStatus(wv);
 		stage.appendChild(wv);
 		this.wvEl = wv;
-
-		this.attachStatus(wv);
-		wv.setAttribute("src", INDEX_URL);
 	}
 
 	/**
@@ -186,14 +183,22 @@ export class RedNoteLoginModal extends Modal {
 		this.stopPolling();
 		this.clearWatchdog();
 		this.detachStatus();
-		// Destroy ONLY this modal's fresh webview element (the modal teardown
-		// would remove it anyway; removing it here is explicit). The session's
-		// hidden sign webview — and the login cookies in the shared partition —
-		// stay untouched: there is no adopt/reclaim coupling to unwind.
+		// Destroy ONLY this modal's fresh webview element. DEFERRED out of the
+		// onClose call stack (Electron crash class #38996: removing a webview
+		// inside a close callback can crash the host process — observed again
+		// on the v3 partition round). The session's hidden sign webview — and
+		// the login cookies in the shared partition — stay untouched.
 		if (this.wvEl) {
-			this.session.log("登录页关闭：销毁本次的登录 webview（签名 webview 不受影响）");
-			this.wvEl.remove();
+			const dying = this.wvEl;
 			this.wvEl = null;
+			this.session.log("登录页关闭：延迟销毁本次的登录 webview（签名 webview 不受影响）");
+			window.setTimeout(() => {
+				try {
+					dying.remove();
+				} catch {
+					/* already detached by the modal teardown */
+				}
+			}, 50);
 		}
 		// Let the plugin clear its re-entry guard (the modal is gone now).
 		this.onClosed();
