@@ -25,7 +25,12 @@ export function cleanNoteFileName(rawTitle: string, noteId: string): string {
 	const stripped = (rawTitle ?? "").replace(WINDOWS_INVALID_CHARS, "");
 	const collapsed = stripped.replace(/\s+/g, " ").trim();
 	const noTrailingDot = collapsed.replace(/\.+$/g, "").replace(/^\.+/, "");
-	return noTrailingDot.length > 0 ? noTrailingDot : (noteId ?? "note");
+	// Windows MAX_PATH: vault root + folder chain + name + ".md" (+ collision
+	// suffix room) must stay under ~260 chars. Cap the stem at 120 — enough
+	// for any realistic folder depth (observed failure: a 200+ char XHS title
+	// produced ENOENT on adapter.write).
+	const capped = noTrailingDot.slice(0, 120).trim();
+	return capped.length > 0 ? capped : (noteId ?? "note");
 }
 
 /**
