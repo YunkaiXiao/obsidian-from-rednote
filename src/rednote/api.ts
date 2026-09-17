@@ -396,6 +396,14 @@ export class RedNoteSession {
 	private container: HTMLElement | null = null;
 	private webview: WebviewEl | null = null;
 	private readyPromise: Promise<void> | null = null;
+	/** Set when login state changed after this page was loaded (see ensureWebview). */
+	private stalePage = false;
+
+	/** Called by the login view on successful login: the resident sign
+	 * webview's page predates the new session and must reload before use. */
+	markStale(): void {
+		this.stalePage = true;
+	}
 	/**
 	 * file:// URL of the userAgentData-spoofing preload script (written by
 	 * main.ts onload via ensureWebviewPreloadFile). Null -> webviews run
@@ -422,7 +430,39 @@ export class RedNoteSession {
 	 */
 	ensureWebview(): Promise<WebviewEl> {
 		this.ensureWebviewElement();
+		// STALE-PAGE REFRESH: the resident sign webview keeps its page state
+		// (SSR, JS context) from whenever it was loaded. After a re-login in
+		// the login webview the partition cookies change, but this page still
+		// reports the OLD account (observed: user_id from a wrong-account era
+		// while the partition already held the right one). Reload before use
+		// so the page state matches the current cookie store.
+		if (this.stalePage) {
+			this.stalePage = false;
+			this.log("签名 webview 页面过期（登录态变更后），重新加载以同步账号状态");
+			return this.reloadSignWebview();
+		}
 		return this.readyPromise!.then(() => this.webview as WebviewEl);
+	}
+
+	/** Reload the resident sign webview and wait for the fresh load. */
+	private reloadSignWebview(): Promise<WebviewEl> {
+		return new Promise((resolve) => {
+			const el = this.webview;
+			if (!el) {
+				resolve(null as unknown as WebviewEl);
+				return;
+			}
+			this.readyPromise = new Promise<void>((r) => {
+				el.addEventListener("did-finish-load", () => r(), { once: true });
+				window.setTimeout(() => r(), 15_000);
+			});
+			if (typeof el.reload === "function") {
+				el.reload();
+			} else {
+				el.setAttribute("src", INDEX_URL);
+			}
+			this.readyPromise.then(() => resolve(this.webview as WebviewEl));
+		});
 	}
 
 	/**

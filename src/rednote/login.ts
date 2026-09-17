@@ -331,6 +331,10 @@ export class RedNoteLoginModal extends ItemView {
 					this.finished = true;
 					this.stopPolling();
 					new Notice("小红书登录成功");
+					// The sign webview's page still holds the pre-login state
+					// (old SSR / possibly a different account) — flag it stale
+					// so the next ensureWebview() reloads before any use.
+					this.session.markStale();
 					this.onStateChange();
 					return;
 				}
