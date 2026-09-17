@@ -1,42 +1,43 @@
 // Login page hosted in a WORKSPACE LEAF (ItemView) — the Surfing-proven host.
 //
-// Rationale (ADR-013): every self-managed container we tried (Modal with
-// reparent, body overlay with visibility/display toggles) eventually hit an
-// Electron webview lifecycle crash — webviews are fragile under custom DOM
-// surgery, and Electron itself documents crashes for close-callback removals
-// and reparenting. A workspace leaf hands the ENTIRE lifecycle to Obsidian:
-// we write zero close/destroy code, the user closes it like any tab, and the
-// reference implementation (PKM-er/Obsidian-Surfing) hosts its webviews the
-// same way. Closing the leaf destroys the webview element — that is FINE:
-// the login session lives in the persist: partition on disk, and the session
-// lazily recreates the webview (parked offscreen) for signed sync requests
-// without any re-login.
+// Login webview rebuild (aligned with the deobfuscated commercial plugin):
+// every OPEN creates a FRESH <webview> element with the proven fixed inline
+// style (width:100%; height:560px), mounts it DIRECTLY into the visible leaf
+// stage, and every CLOSE destroys it. The element is never reparented and
+// never parked offscreen — the guest attaches to an already visible, already
+// correctly sized element, so the old "short strip" defect (guest viewport
+// frozen at its attach-time size after leaf ↔ offscreen body round-trips)
+// cannot occur, and none of the old kick/reload/zoom workarounds exist here.
+//
+// The SIGN webview (src/rednote/api.ts, ensureWebviewElement) is a separate,
+// hidden, resident element marked data-pull-role="sign" sharing the same
+// persist: partition. It never hosts the login UI. Login detection polls
+// session.checkLogin(), whose partition cookie reads and page evals run
+// against the sign webview, so a completed QR login up here is visible there
+// immediately through the shared cookie store.
 
 import { ItemView, Notice } from "obsidian";
-import { RedNoteSession } from "./api";
+import { CHROME_UA, INDEX_URL, WEBVIEW_PARTITION, RedNoteSession } from "./api";
 
 export const LOGIN_LEAF_VIEW_TYPE = "pull-rednote-login";
 
 /** Padding (px) applied to the leaf content element in onOpen. */
 const CONTENT_PADDING_PX = 8;
-/** Fallback status-line height (px) if the real box is not measurable yet. */
-const STATUS_LINE_HEIGHT_PX = 28;
+/** Fixed login webview height (px) — the commercial plugin's scheme uses 500. */
+const LOGIN_WEBVIEW_HEIGHT_PX = 560;
 
 export class RedNoteLoginView extends ItemView {
 	private session: RedNoteSession;
 	private onStateChange: () => void;
 	private statusEl: HTMLElement | null = null;
 	private stageEl: HTMLElement | null = null;
-	/** The webview element actually staged in this leaf (may differ from the
-	 * session's current one after a lazy recreation — see the poller). */
+	/** The fresh webview element created in onOpen, destroyed in onClose. */
 	private wvEl: HTMLElement | null = null;
 	private statusHandlers: Array<[string, EventListener]> = [];
 	private watchdogTimer: number | null = null;
 	private pollTimer: number | null = null;
-	private censusTimer: number | null = null;
 	private pollFailures = 0;
 	private finished = false;
-	private stageSize = { w: 480, h: 640 };
 
 	constructor(
 		leaf: import("obsidian").WorkspaceLeaf,
@@ -77,72 +78,56 @@ export class RedNoteLoginView extends ItemView {
 		this.stageEl.addClass("pull-rednote-login-stage");
 		this.stageEl.style.cssText = "flex:1 1 auto;position:relative;min-height:200px;";
 
-		// The webview container moves into the leaf ONCE, here. The leaf's DOM
-		// is owned by Obsidian for its whole lifetime — we never move or hide
-		// the webview ourselves.
-		const wv = this.session.ensureWebviewElement();
-		const container = wv.parentElement as HTMLElement;
-		this.stageEl.appendChild(container);
+		// A FRESH element every open — NEVER the session's resident sign
+		// webview and never a recycled one. Attributes follow the proven
+		// order (useragent BEFORE partition, both BEFORE attach and src):
+		// the webview is attribute-driven in this Electron build and plain
+		// property assignment is never reflected (see ensureWebviewElement).
+		const wv = document.createElement("webview");
+		wv.setAttribute("useragent", CHROME_UA);
+		wv.setAttribute("partition", WEBVIEW_PARTITION);
+		// Role marker: keeps the session's partition-scoped reclaim query from
+		// ever adopting THIS element as the sign webview (see api.ts).
+		wv.setAttribute("data-pull-role", "login");
+		// The commercial plugin's fixed sizing: a brand-new VISIBLE element at
+		// a fixed height needs no kick/reload/zoom — the guest viewport is
+		// correct from the very first attach.
+		wv.style.cssText =
+			`width:100%;height:${LOGIN_WEBVIEW_HEIGHT_PX}px;display:block;border:none;`;
+		// Same element-level deny as the sign webview: our clean partition is
+		// outside Obsidian's per-session permission sandbox.
+		wv.addEventListener("permissionrequest", (e: Event) => {
+			(e as Event & { preventDefault?: () => void }).preventDefault?.();
+		});
+
+		// Mount into the VISIBLE leaf first; only then start the navigation,
+		// so the guest attaches at the final element size (100% × 560px).
+		this.stageEl.appendChild(wv);
 		this.wvEl = wv;
-		// Clear the offscreen PARKING styles the session set when it created
-		// the container (position:fixed; left:-99999px; 1200x800). Inline
-		// styles beat every class rule, so leaving them in place would keep
-		// the login page invisible / mis-sized inside the leaf. applySize()
-		// writes real px width/height below.
-		container.style.position = "static";
-		container.style.left = "auto";
-		container.style.top = "auto";
-		container.style.width = "";
-		container.style.height = "";
-		container.addClass("pull-rednote-login-container");
-		wv.addClass("pull-rednote-login-webview");
 
-		// Leaf layout settles asynchronously (and re-settles on popout/resize).
-		// A single 50ms probe measured a pre-layout box and left the webview at
-		// its default ~480px size in the corner of a large leaf. Retry on
-		// several early ticks and on every workspace resize (onResize below).
-		for (const delay of [50, 200, 600, 1500]) {
-			window.setTimeout(() => {
-				this.applySize();
-				this.kickGuestResize();
-			}, delay);
-		}
+		this.attachStatus(wv);
+		wv.setAttribute("src", INDEX_URL);
 
-		// Last-resort guest viewport sync: reload the page ONCE after the
-		// layout has settled so the guest attaches at the final element size.
-		// (Neither inline px nor absolute-fill sizing nor display-toggle kicks
-		// could revive a guest stuck at its attach-time viewport in this
-		// Electron build; a fresh load at the right size does.)
-		window.setTimeout(() => {
-			const wv = this.stagedWebview() as
-				| (HTMLElement & { reload?: () => void; setZoomFactor?: (f: number) => void })
-				| null;
-			if (wv?.reload) {
-				this.session.log("登录页：一次性 reload 以同步 guest 视口");
-				wv.reload();
-			}
-		}, 1800);
-
-		this.attachStatus();
 		this.startPolling();
+		// Warm the hidden sign webview (the eval target for checkLogin and the
+		// page recorder) without touching the login element above.
 		void this.session.ensureWebview();
 	}
 
-	/** Workspace calls this whenever the leaf (or its popout window) resizes. */
-	onResize(): void {
-		this.applySize();
-		this.kickGuestResize();
-	}
-
 	async onClose(): Promise<void> {
-		// Stop our timers/listeners only. The webview element is destroyed
-		// together with the leaf DOM by Obsidian itself (the Surfing pattern);
-		// the session notices via the "destroyed" listener and lazily recreates
-		// a parked webview for later signed requests — no re-login needed.
 		this.finished = true;
 		this.stopPolling();
 		this.clearWatchdog();
 		this.detachStatus();
+		// Destroy ONLY this view's fresh webview element (the leaf teardown
+		// would remove it anyway; removing it here is explicit). The session's
+		// hidden sign webview — and the login cookies in the shared partition —
+		// stay untouched: there is no adopt/reclaim coupling to unwind.
+		if (this.wvEl) {
+			this.session.log("登录页关闭：销毁本次的登录 webview（签名 webview 不受影响）");
+			this.wvEl.remove();
+			this.wvEl = null;
+		}
 	}
 
 	private setStatus(text: string): void {
@@ -161,105 +146,20 @@ export class RedNoteLoginView extends ItemView {
 	}
 
 	/**
-	 * Size the webview in integer px from the leaf's REAL layout box
-	 * (this.contentEl — not the stage, whose own box can be collapsed by CSS).
-	 * Height = content box minus the status line. The result is written as
-	 * inline px to all three layers (stage, container, webview) so no CSS
-	 * rule can shrink the visible page to a thin strip.
+	 * Load-state listeners for THIS view's webview only (status line). No page
+	 * hooks here: the request recorder (fetch/XHR interception + warmup) is a
+	 * duty of the SIGN webview and is installed through session.eval against
+	 * it — kept as before on did-finish-load (idempotent).
 	 */
-	/** The webview element actually inside this leaf's stage (preferred), or
-	 * the session's current one. Sizing the staged element matters: after a
-	 * lazy recreation the session's current webview may be a DIFFERENT
-	 * (parked, invisible) element while the leaf still shows the old one. */
-	private stagedWebview(): (HTMLElement & { setZoomFactor?: (f: number) => void }) | null {
-		const inStage = this.stageEl?.querySelector("webview") as
-			| (HTMLElement & { setZoomFactor?: (f: number) => void })
-			| null;
-		return inStage ?? this.session.getWebview();
-	}
-
-	/** Compute the stage size from the leaf's REAL layout box (contentEl) and
-	 * apply it as inline px to the staged webview's three layers. */
-	private applySize(): void {
-		const wv = this.stagedWebview();
-		if (!wv || !this.stageEl) {
-			return;
-		}
-		const box = this.contentEl.getBoundingClientRect();
-		const statusBox = this.statusEl?.getBoundingClientRect();
-		const statusH = Math.ceil(statusBox?.height ?? STATUS_LINE_HEIGHT_PX) || STATUS_LINE_HEIGHT_PX;
-		const w = Math.floor(box.width) - CONTENT_PADDING_PX * 2;
-		const h = Math.floor(box.height) - CONTENT_PADDING_PX * 2 - statusH;
-		// Adopt the measurement only when it is a plausible box; otherwise keep
-		// the last known good (or default) size.
-		if (w > 40 && h > 40) {
-			this.stageSize = { w, h };
-		}
-		const { w: sw, h: sh } = this.stageSize;
-		this.stageEl.style.width = `${sw}px`;
-		this.stageEl.style.height = `${sh}px`;
-		const container = wv.parentElement;
-		if (container) {
-			container.style.width = `${sw}px`;
-			container.style.height = `${sh}px`;
-		}
-		wv.style.width = `${sw}px`;
-		wv.style.height = `${sh}px`;
-	}
-
-	/**
-	 * Force the Electron guest to re-sync its viewport to the element size
-	 * (pages that loaded under a non-visible host keep a stale tiny viewport),
-	 * then zoom out slightly so the centered, non-scrolling XHS login dialog
-	 * fits even shorter leaves.
-	 */
-	private kickGuestResize(): void {
-		const wv = this.stagedWebview();
-		if (!wv) {
-			return;
-		}
-		const { w, h } = this.stageSize;
-		wv.style.display = "none";
-		wv.style.width = `${w}px`;
-		wv.style.height = `${h}px`;
-			window.setTimeout(() => {
-				wv.style.display = "block";
-				window.setTimeout(() => {
-					const rect = wv.getBoundingClientRect();
-					if (rect.height < h - 20) {
-						const stage = this.stageEl?.getBoundingClientRect();
-						this.setStatus(
-							`⚠ 尺寸异常：元素${Math.round(rect.width)}×${Math.round(rect.height)}` +
-								` 舞台${stage ? `${Math.round(stage.width)}×${Math.round(stage.height)}` : "?"}` +
-								` 目标${w}×${h}，请反馈此行`,
-						);
-					}
-					// Aggressive zoom: the guest viewport renders far smaller than
-				// the element in this Electron build; zooming the PAGE content
-				// (not the element) is the only lever that reliably makes the
-				// whole login dialog visible inside the small guest area.
-				wv.setZoomFactor?.(0.45);
-				}, 60);
-			}, 30);
-	}
-
-	private attachStatus(): void {
+	private attachStatus(wv: HTMLElement): void {
 		this.detachStatus();
-		const wv = this.session.getWebview();
-		if (!wv) {
-			return;
-		}
 		const attach = (name: string, handler: EventListener): void => {
 			wv.addEventListener(name, handler);
 			this.statusHandlers.push([name, handler]);
 		};
 		attach("did-start-loading", () => this.setStatus("加载中…"));
-		attach("dom-ready", () => {
-			this.setStatus("页面已加载 ✓");
-			this.kickGuestResize();
-			// Install the request recorder BEFORE the page's organic API burst
-			// (fetch + XHR — XHS's own calls go through XHR/axios, which a
-			// fetch-only hook misses entirely).
+		attach("dom-ready", () => this.setStatus("页面已加载 ✓"));
+		attach("did-finish-load", () => {
 			void this.session.installPageRecorder();
 		});
 		attach("did-stop-loading", () => this.setStatus("页面已加载 ✓"));
@@ -294,35 +194,26 @@ export class RedNoteLoginView extends ItemView {
 	}
 
 	private detachStatus(): void {
-		const wv = this.session.getWebview();
-		if (wv) {
-			for (const [name, handler] of this.statusHandlers) {
-				wv.removeEventListener(name, handler);
-			}
+		for (const [name, handler] of this.statusHandlers) {
+			this.wvEl?.removeEventListener(name, handler);
 		}
 		this.statusHandlers = [];
 	}
 
+	/**
+	 * Unchanged login poll: session.checkLogin() reads the SHARED partition
+	 * (its API call uses the partition cookie store and its page-probe evals
+	 * run in the hidden sign webview), so a QR scan completed in the visible
+	 * login webview is detected here without ever touching that element.
+	 */
 	private startPolling(): void {
 		this.stopPolling();
 		this.pollFailures = 0;
-		// Periodic census log (independent of poll success/failure) so the
-		// layout data is always captured while the login view is open.
-		this.censusTimer = window.setInterval(() => {
-			if (this.finished) {
-				return;
-			}
-			this.session.log(`登录页：${this.domCensus()} 目标${this.stageSize.w}×${this.stageSize.h}`);
-		}, 30000);
 		const check = async (): Promise<void> => {
 			if (this.finished) {
 				return;
 			}
-		this.adoptRecreatedWebview();
-		// Re-measure every cycle: the leaf layout box may only become valid
-		// after popout/activation/tab shuffling that fires no resize event.
-		this.applySize();
-		try {
+			try {
 				const ok = await this.session.checkLogin();
 				if (ok) {
 					this.finished = true;
@@ -333,12 +224,8 @@ export class RedNoteLoginView extends ItemView {
 				}
 				this.pollFailures += 1;
 				if (this.pollFailures % 3 === 1) {
-					const census = this.domCensus();
 					this.setStatus(
-						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}｜${census}`,
-					);
-					this.session.log(
-						`登录页：${census} 目标${this.stageSize.w}×${this.stageSize.h}`,
+						`页面已加载，登录检测未通过：${this.session.lastCheckInfo ?? "未知原因"}`,
 					);
 				}
 			} catch (e) {
@@ -352,61 +239,10 @@ export class RedNoteLoginView extends ItemView {
 		this.pollTimer = window.setTimeout(check, 4000);
 	}
 
-	/** If the stage has NO webview at all (e.g. logout destroyed it), adopt
-	 * the session's current one. NEVER touches a live staged element: the old
-	 * unconditional swap fed a destroy→recreate→swap loop that reloaded the
-	 * page every couple of seconds (QR could never complete a scan). */
-	private adoptRecreatedWebview(): void {
-		if (!this.stageEl) {
-			return;
-		}
-		if (this.stageEl.querySelector("webview")) {
-			return;
-		}
-		const cur = this.session.getWebview();
-		if (!cur) {
-			return;
-		}
-		const container = cur.parentElement as HTMLElement | null;
-		if (!container) {
-			return;
-		}
-		this.stageEl.appendChild(container);
-		container.style.position = "static";
-		container.style.left = "auto";
-		container.style.top = "auto";
-		container.style.width = "";
-		container.style.height = "";
-		container.addClass("pull-rednote-login-container");
-		cur.addClass("pull-rednote-login-webview");
-		this.wvEl = cur;
-		this.attachStatus();
-		this.applySize();
-		this.kickGuestResize();
-	}
-
-	/** Host-side webview census for the status line: how many <webview>
-	 * elements exist, how big each renders, and the measured contentEl box
-	 * (so a failing layout measurement is visible at a glance). */
-	private domCensus(): string {
-		const els = Array.from(document.querySelectorAll("webview"));
-		const rects = els.map((el) => {
-			const r = el.getBoundingClientRect();
-			const cs = getComputedStyle(el);
-			return `${Math.round(r.width)}×${Math.round(r.height)}(css ${cs.position},${cs.width},${cs.height})`;
-		});
-		const box = this.contentEl.getBoundingClientRect();
-		return `DOM webview×${els.length}[${rects.join(", ")}] 盒${Math.round(box.width)}×${Math.round(box.height)}`;
-	}
-
 	private stopPolling(): void {
 		if (this.pollTimer != null) {
 			window.clearTimeout(this.pollTimer);
 			this.pollTimer = null;
-		}
-		if (this.censusTimer != null) {
-			window.clearInterval(this.censusTimer);
-			this.censusTimer = null;
 		}
 	}
 }

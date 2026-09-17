@@ -58,8 +58,10 @@ import {
 	EDGE_UA as WIRE_EDGE_UA,
 } from "./wire";
 
-/** The partition isolates this session from Obsidian's default browser session. */
-const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — the v1 partition's a1 got server-flagged after 2 days of debug traffic
+/** The partition isolates this session from Obsidian's default browser session.
+ * SHARED with the login view's fresh webview (RedNoteLoginView) — the shared
+ * cookie store is what makes a login there instantly visible here. */
+export const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — the v1 partition's a1 got server-flagged after 2 days of debug traffic
 /**
  * Chrome UA matching the user's real local Chrome build. With the clean-
  * partition IPC swallow (see initCleanPartition) this attribute WORKS: the
@@ -67,7 +69,7 @@ const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — t
  * requests (Obsidian's per-partition webRequest hook deletes those headers
  * and rewrites the UA — the root cause of the permanent HTTP 406s).
  */
-const CHROME_UA =
+export const CHROME_UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
 	"Chrome/153.0.0.0 Safari/537.36";
 
@@ -133,7 +135,7 @@ export function initCleanPartition(log?: (line: string) => void): void {
 }
 
 const HOST = "https://edith.xiaohongshu.com";
-const INDEX_URL = "https://www.xiaohongshu.com/explore"; // explore: page-load fires a signed homefeed POST (carries x-rap-param for capture) — same landing as the reference plugin
+export const INDEX_URL = "https://www.xiaohongshu.com/explore"; // explore: page-load fires a signed homefeed POST (carries x-rap-param for capture) — same landing as the reference plugin
 
 /** A <webview> element — not typed in the bundled obsidian d.ts, so a minimal cast. */
 type WebviewEl = HTMLElement & {
@@ -305,15 +307,18 @@ export class FetchError extends Error {
 }
 
 /**
- * Owns the resident webview, login state, and the signed data pipeline.
+ * Owns the resident SIGN webview, login state, and the signed data pipeline.
  *
- * The webview is created on first use and is NEVER removed from the DOM
- * (parked offscreen via position:fixed as a direct child of document.body).
- * Removing it would drop the session and require a re-login. `destroy()`
- * removes it only on plugin unload. The login modal borrows the container
- * temporarily and MUST re-parent it back to document.body in its onClose()
- * (see RedNoteLoginModal): Obsidian may detach the modal DOM after close,
- * and a webview left inside that subtree would be destroyed with it.
+ * The sign webview is created on first use and is NEVER removed from the DOM
+ * (parked offscreen via position:fixed as a direct child of document.body,
+ * marked data-pull-role="sign"). Removing it would drop the session and
+ * require a re-login. `destroy()` removes it only on plugin unload.
+ *
+ * It is a DIFFERENT element from the login view's webview (RedNoteLoginView):
+ * that one is created fresh on every open, marked data-pull-role="login",
+ * destroyed on close, and never traded between parents. The two share only
+ * the persist: partition — its cookie store makes a login in the visible
+ * login webview immediately visible to checkLogin()/signing here.
  */
 export class RedNoteSession {
 	private container: HTMLElement | null = null;
@@ -351,12 +356,15 @@ export class RedNoteSession {
 		if (this.webview) {
 			return this.webview;
 		}
-		// RECLAIM before creating: after a destroy/recreate cycle the login
-		// leaf may still hold a LIVE webview of ours while this method would
-		// create a SECOND one — the split (visible page vs. eval target) made
-		// every check talk to the wrong page (observed: DOM webview×2).
+		// RECLAIM before creating: adopt a live SIGN webview if one exists
+		// without session refs (e.g. after a destroy/recreate edge). The
+		// [data-pull-role="sign"] filter is LOAD-BEARING: the login view's
+		// fresh webview carries the SAME partition but data-pull-role="login"
+		// and is owned (created/destroyed) by RedNoteLoginView — adopting it
+		// here would yank the visible login page into the offscreen parking
+		// container and corrupt the sign session in one step.
 		const existing = document.querySelector(
-			`webview[partition="${WEBVIEW_PARTITION}"]`,
+			`webview[partition="${WEBVIEW_PARTITION}"][data-pull-role="sign"]`,
 		) as WebviewEl | null;
 		if (existing) {
 			this.log("reclaim: adopting existing live webview from the document");
@@ -378,6 +386,10 @@ export class RedNoteSession {
 		// attribute now actually applies and XHS sees a genuine Chrome UA.
 		el.setAttribute("useragent", CHROME_UA);
 		el.setAttribute("partition", WEBVIEW_PARTITION);
+		// Role marker: separates this RESIDENT sign webview from the login
+		// view's fresh webview (data-pull-role="login", same partition) so the
+		// reclaim query above can only ever adopt an element of THIS role.
+		el.setAttribute("data-pull-role", "sign");
 		// NOTE: allowpopups is intentionally NOT set. Electron treats boolean
 		// webview attributes by PRESENCE (any value, including "false", means
 		// enabled), so setAttribute("allowpopups", "false") would have been
