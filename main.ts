@@ -7,7 +7,12 @@
 
 import { App, Notice, Plugin, PluginSettingTab, Setting, ToggleComponent, TextComponent } from "obsidian";
 
-import { RedNoteSession, cleanPartitionStatus } from "./src/rednote/api";
+import {
+	RedNoteSession,
+	cleanPartitionStatus,
+	ensureWebviewPreloadFile,
+	WEBVIEW_PRELOAD_FILENAME,
+} from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal } from "./src/rednote/login";
@@ -119,6 +124,17 @@ export default class RedNoteSyncPlugin extends Plugin {
 				void this.saveSettings();
 			},
 		};
+		// Short-strip final fix: write the userAgentData-spoofing preload
+		// script into the plugin dir and hand its file:// URL to every webview
+		// we create (login modal + sign). A null result (fs missing / write
+		// failed) leaves the webviews without preload — the previous behavior.
+		this.session.webviewPreloadUrl = ensureWebviewPreloadFile(
+			`${vaultRoot}/${this.manifest.dir}`,
+			(line) => this.session.log(line),
+		);
+		if (this.session.webviewPreloadUrl) {
+			this.session.log(`登录/签名 webview preload 已就绪（${WEBVIEW_PRELOAD_FILENAME}）`);
+		}
 		this.session.log(`分区拦截状态：${cleanPartitionStatus.value}`);
 			} catch (e) {
 				console.warn("[pull-rednote] fs logger init failed:", e);

@@ -9,6 +9,16 @@
 // (guest viewport frozen at its attach-time size) cannot occur, and none of
 // the old kick/reload/zoom workarounds exist here.
 //
+// Short-strip FINAL fix (aligned with the deobfuscated commercial plugin):
+// XHS serves its page layout from a UA + navigator.userAgentData dual
+// fingerprint. With only the UA attribute (macOS Chrome/120) the page still
+// rendered as a ~500x140 strip, so the login webview additionally carries
+// `webpreferences="preload=<file:// URL>"` pointing at a plugin-dir script
+// (login-preload.js, written at startup by main.ts via
+// ensureWebviewPreloadFile) that defines the Chromium-120 macOS
+// userAgentData. If an Obsidian build rejects webpreferences and the load
+// fails, the element is rebuilt ONCE without the preload (old behavior).
+//
 // Why a Modal (and not the previous workspace leaf): inside a leaf the same
 // fixed-size webview rendered as a ~700x150 strip — the leaf's nested
 // .workspace-leaf -> .view-content containment/overflow chain fights the
@@ -46,6 +56,10 @@ export class RedNoteLoginModal extends Modal {
 	/** The fresh webview element created in onOpen, destroyed in onClose. */
 	private wvEl: HTMLElement | null = null;
 	private statusHandlers: Array<[string, EventListener]> = [];
+	/** Whether the CURRENT element carries the preload spoof attribute. */
+	private preloadApplied = false;
+	/** Whether any load of the CURRENT element has succeeded. */
+	private loadedOnce = false;
 	private watchdogTimer: number | null = null;
 	private pollTimer: number | null = null;
 	private pollFailures = 0;
@@ -82,14 +96,42 @@ export class RedNoteLoginModal extends Modal {
 		this.stageEl.addClass("pull-rednote-login-stage");
 		this.stageEl.style.cssText = "flex:1 1 auto;position:relative;min-height:200px;";
 
-		// A FRESH element every open — NEVER the session's resident sign
-		// webview and never a recycled one. Attributes follow the proven
-		// order (useragent BEFORE partition, both BEFORE attach and src):
-		// the webview is attribute-driven in this Electron build and plain
-		// property assignment is never reflected (see ensureWebviewElement).
+		this.mountWebView(this.session.webviewPreloadUrl != null);
+
+		this.startPolling();
+		// Warm the hidden sign webview (the eval target for checkLogin and the
+		// page recorder) without touching the login element above.
+		void this.session.ensureWebview();
+	}
+
+	/**
+	 * Create THIS modal's fresh login webview, mount it into the visible
+	 * stage, and start the navigation. A FRESH element every call — NEVER the
+	 * session's resident sign webview and never a recycled one.
+	 *
+	 * `withPreload` adds `webpreferences="preload=…"` (the userAgentData
+	 * spoof — the commercial plugin's short-strip fix: XHS serves its layout
+	 * from a UA + userAgentData dual fingerprint, and the UA attribute alone
+	 * still produced a ~500x140 strip). Attributes follow the proven order
+	 * (useragent BEFORE partition, all of them BEFORE attach and src): the
+	 * webview is attribute-driven in this Electron build and plain property
+	 * assignment is never reflected (see ensureWebviewElement).
+	 */
+	private mountWebView(withPreload: boolean): void {
+		const stage = this.stageEl;
+		if (!stage) {
+			return;
+		}
 		const wv = document.createElement("webview");
+		this.preloadApplied = false;
+		this.loadedOnce = false;
 		wv.setAttribute("useragent", CHROME_UA);
 		wv.setAttribute("partition", WEBVIEW_PARTITION);
+		const preloadUrl = this.session.webviewPreloadUrl;
+		this.preloadApplied = withPreload && preloadUrl != null;
+		if (this.preloadApplied && preloadUrl) {
+			wv.setAttribute("webpreferences", `preload=${preloadUrl}`);
+		}
 		// Role marker: keeps the session's partition-scoped reclaim query from
 		// ever adopting THIS element as the sign webview (see api.ts).
 		wv.setAttribute("data-pull-role", "login");
@@ -107,16 +149,28 @@ export class RedNoteLoginModal extends Modal {
 		// Mount into the VISIBLE modal content first; only then start the
 		// navigation, so the guest attaches at the final element size
 		// (100% × 520px).
-		this.stageEl.appendChild(wv);
+		stage.appendChild(wv);
 		this.wvEl = wv;
 
 		this.attachStatus(wv);
 		wv.setAttribute("src", INDEX_URL);
+	}
 
-		this.startPolling();
-		// Warm the hidden sign webview (the eval target for checkLogin and the
-		// page recorder) without touching the login element above.
-		void this.session.ensureWebview();
+	/**
+	 * Fallback for an Obsidian build that rejects the webpreferences preload:
+	 * if the load fails (main frame, before any success) while the spoof is
+	 * active, rebuild the element ONCE without it — the previously working
+	 * behavior — and leave an explicit log line. Real-device verification
+	 * remains the only standard for whether preload is actually applied.
+	 */
+	private rebuildWithoutPreload(): void {
+		this.session.log(
+			"preload 回退：did-fail-load 疑似 webpreferences 被拒，重建不带 preload 的登录 webview",
+		);
+		this.detachStatus();
+		this.wvEl?.remove();
+		this.wvEl = null;
+		this.mountWebView(false);
 	}
 
 	onClose(): void {
@@ -165,15 +219,30 @@ export class RedNoteLoginModal extends Modal {
 			this.statusHandlers.push([name, handler]);
 		};
 		attach("did-start-loading", () => this.setStatus("加载中…"));
-		attach("dom-ready", () => this.setStatus("页面已加载 ✓"));
+		attach("dom-ready", () => {
+			this.loadedOnce = true;
+			this.setStatus("页面已加载 ✓");
+		});
 		attach("did-finish-load", () => {
+			this.loadedOnce = true;
 			void this.session.installPageRecorder();
 		});
 		attach("did-stop-loading", () => this.setStatus("页面已加载 ✓"));
 		attach("did-fail-load", (e: Event): void => {
-			const ext = e as Event & { errorCode?: number; detail?: { errorCode?: number } };
+			const ext = e as Event & {
+				errorCode?: number;
+				isMainFrame?: boolean;
+				detail?: { errorCode?: number; isMainFrame?: boolean };
+			};
 			const code = ext.errorCode ?? ext.detail?.errorCode;
+			const main = ext.isMainFrame ?? ext.detail?.isMainFrame;
 			this.setStatus(`⚠ 页面加载失败（code=${code ?? "?"}），请把此行反馈给开发者`);
+			// Preload fallback (see rebuildWithoutPreload): only a MAIN-frame
+			// failure before any successful load implicates the preload
+			// attribute; subframe noise must not trigger the rebuild.
+			if (this.preloadApplied && !this.loadedOnce && main !== false) {
+				this.rebuildWithoutPreload();
+			}
 		});
 		attach("console-message", (e: Event): void => {
 			const ext = e as Event & {

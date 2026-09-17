@@ -11,6 +11,10 @@
 // request; a full page of known cards ends that list's pagination early
 // (XHS lists favorites newest-first), and a non-advancing next_cursor
 // terminates the loop instead of re-listing the same batch forever.
+// Layout: a 收藏夹 note is written to {notesFolder}/{收藏夹名}/《标题》.md (the
+// folder name cleaned like a file name); flat ungrouped favorites stay at the
+// notes root. Pre-layout files are never migrated — hash-equal notes keep
+// their old index paths; only fresh/rewritten notes use the new structure.
 //
 // Pure decision logic (filename, render, page parse, extraction, hash) lives in
 // the pure modules and is unit-tested; this file only orchestrates side effects.
@@ -27,7 +31,7 @@ import { toRecord } from "./extract";
 import { renderNoteMarkdown, appendAiSection, type NoteMediaMap } from "./markdown";
 import { computeNoteHash, type NoteIndex } from "./hash";
 import { syncNoteMedia } from "./media";
-import { resolveRewriteFileName } from "./filename";
+import { cleanCollectionFolderName, resolveRewriteFileName } from "./filename";
 import { splitSeen } from "./pagination";
 
 export type { NoteIndex, NoteIndexEntry } from "./hash";
@@ -128,6 +132,14 @@ async function ensureFolderPath(vault: Vault, folderPath: string): Promise<strin
 }
 
 /**
+ * Vault-root-relative directory of a file path ("" for a root-level file).
+ */
+function dirOf(filePath: string): string {
+	const i = filePath.lastIndexOf("/");
+	return i < 0 ? "" : filePath.slice(0, i);
+}
+
+/**
  * Per-page diagnostic line (M3.1): card count / has_more / cursor prefix, so
  * pagination behavior is traceable in debug.log. `rawDuplicates` is the
  * in-page duplicate count (counted on the RAW page in the api layer —
@@ -222,13 +234,25 @@ export async function syncFavorites(
 
 	// Resolve the target folder path (adapter/disk-based, index-independent).
 	const folderPath = await ensureFolderPath(vault, opts.notesFolder);
-	const folderPrefix = folderPath === "/" ? "" : `${folderPath}/`;
-	const existing = new Set<string>(
-		vault
-			.getMarkdownFiles()
-			.filter((f) => (f.parent?.path ?? "") === folderPath)
-			.map((f) => f.name),
-	);
+	const rootPrefix = folderPath === "/" ? "" : `${folderPath}/`;
+	// Per-directory taken-name sets: file names only collide WITHIN one
+	// directory, and 收藏夹 notes are written under
+	// {notesFolder}/{收藏夹名}/ while flat notes stay at the notes root — so
+	// the conflict namespace must be resolved per target directory. Grouped
+	// once from the vault index; directories that materialize mid-run (fresh
+	// collection folders) get lazily created sets that writes keep updated.
+	const existingByDir = new Map<string, Set<string>>();
+	const existingSetFor = (dir: string): Set<string> => {
+		let set = existingByDir.get(dir);
+		if (!set) {
+			set = new Set();
+			existingByDir.set(dir, set);
+		}
+		return set;
+	};
+	for (const f of vault.getMarkdownFiles()) {
+		existingSetFor(f.parent?.path ?? "").add(f.name);
+	}
 
 	// 2. Run-scoped first-seen dedupe (M3.1): a note_id claimed by its FIRST
 	//    encounter (board or flat) is never processed again this run. Memory
@@ -362,8 +386,29 @@ export async function syncFavorites(
 				}
 			}
 
-			const name = resolveRewriteFileName(record.title, record.note_id, existing, prev?.file);
-			const filePath = `${folderPrefix}${name}`;
+			// Target directory (collection layout): a 收藏夹 note goes under
+			// {notesFolder}/{收藏夹名}/ (folder name cleaned like a file
+			// name); flat ungrouped favorites (collection "") stay at the
+			// notes root. Pre-layout files are never migrated — only fresh /
+			// rewritten notes use the new structure; hash-equal notes keep
+			// their old index paths untouched.
+			const collectionDir = collection ? cleanCollectionFolderName(collection) : "";
+			const targetDir = collectionDir
+				? folderPath === "/"
+					? `/${collectionDir}`
+					: `${folderPath}/${collectionDir}`
+				: folderPath;
+			const targetPrefix = targetDir === "/" ? "" : `${targetDir}/`;
+			await ensureFolderPath(vault, targetDir);
+			const existing = existingSetFor(targetDir);
+			// In-place name reuse only applies when the previous file lives in
+			// the SAME directory: a pre-layout root file must not free its
+			// basename inside a collection directory where another note may
+			// own the same name.
+			const prevSameDirFile =
+				prev?.file && dirOf(prev.file) === targetDir ? prev.file : undefined;
+			const name = resolveRewriteFileName(record.title, record.note_id, existing, prevSameDirFile);
+			const filePath = `${targetPrefix}${name}`;
 			// Write via the adapter (disk truth): the vault-index APIs
 			// depend on the folder being indexed, which breaks on stale
 			// indexes (externally deleted folders). adapter.write works
@@ -381,16 +426,19 @@ export async function syncFavorites(
 			const prevBase = prev?.file
 				? prev.file.slice(prev.file.lastIndexOf("/") + 1)
 				: undefined;
+			// Guard against ANY stale copy under the notes tree (not just the
+			// target directory): a pre-layout root file whose note is now
+			// rewritten into a collection directory is exactly the same note
+			// and must not survive as a duplicate.
 			if (
 				prev?.file &&
 				prev.file !== filePath &&
-				prevBase !== name &&
-				prev.file.startsWith(folderPrefix) &&
+				prev.file.startsWith(rootPrefix) &&
 				(await vault.adapter.exists(prev.file))
 			) {
 				try {
 					await vault.adapter.remove(prev.file);
-					existing.delete(prevBase ?? "");
+					existingSetFor(dirOf(prev.file)).delete(prevBase ?? "");
 					session.log(`重写换名，旧文件已删除：${prev.file} -> ${filePath}`);
 				} catch (e) {
 					// Never fail the note because its stale copy survived.

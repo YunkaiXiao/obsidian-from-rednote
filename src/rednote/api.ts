@@ -82,6 +82,70 @@ export const CHROME_UA =
 	"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /**
+ * Preload spoof (short-strip final fix, per the deobfuscated commercial
+ * plugin): XHS serves its page layout from a UA + navigator.userAgentData
+ * DUAL fingerprint. The UA attribute alone left userAgentData undefined /
+ * Windows-shaped, and the page still rendered as a ~500x140 strip. This
+ * one-liner, loaded as the webviews' preload, defines the Chromium-120
+ * macOS userAgentData shape matching CHROME_UA above.
+ */
+export const UA_SPOOF_PRELOAD_JS =
+	"Object.defineProperty(navigator, 'userAgentData', { get: () => ({ brands: [{brand:'Not_A Brand',version:'8'},{brand:'Chromium',version:'120'},{brand:'Google Chrome',version:'120'}], mobile: false, platform: 'macOS' }) });\n";
+
+/** Preload script file name, written into the plugin directory at startup. */
+export const WEBVIEW_PRELOAD_FILENAME = "login-preload.js";
+
+/**
+ * Convert an absolute filesystem path into a file:// URL for the webviews'
+ * `webpreferences="preload=…"` attribute: backslashes -> forward slashes,
+ * every path segment percent-encoded (spaces, CJK, "#", "?" …). The Windows
+ * drive segment ("E:") is kept verbatim — "file:///E:/…" is the canonical
+ * form Chromium resolves.
+ */
+export function fileUrlFromPath(absPath: string): string {
+	const parts = (absPath ?? "").replace(/\\/g, "/").split("/").filter((p) => p.length > 0);
+	const encoded = parts.map((p, i) =>
+		i === 0 && /^[A-Za-z]:$/.test(p) ? p : encodeURIComponent(p),
+	);
+	return `file:///${encoded.join("/")}`;
+}
+
+/**
+ * Write the userAgentData-spoofing preload script into the plugin directory
+ * (overwritten each startup so the content stays in sync with the constant)
+ * and return its file:// URL. Called from main.ts onload. A null return
+ * (node fs unavailable / write failed) leaves the webviews running WITHOUT
+ * preload — exactly the previous behavior — so this can never block login.
+ */
+export function ensureWebviewPreloadFile(
+	pluginDir: string,
+	log?: (line: string) => void,
+): string | null {
+	try {
+		const req = (window as unknown as { require?: (m: string) => unknown }).require;
+		const fs = req?.("fs") as typeof import("fs") | undefined;
+		const dir = (pluginDir ?? "").replace(/[\\/]+$/, "");
+		if (!fs?.writeFileSync) {
+			log?.("preload 脚本写入跳过：node fs 不可用");
+			return null;
+		}
+		if (!dir) {
+			log?.("preload 脚本写入跳过：插件目录未知");
+			return null;
+		}
+		const file = `${dir}/${WEBVIEW_PRELOAD_FILENAME}`;
+		fs.writeFileSync(file, UA_SPOOF_PRELOAD_JS, "utf8");
+		log?.(`preload 脚本已写入：${file}`);
+		return fileUrlFromPath(file);
+	} catch (e) {
+		log?.(
+			`preload 脚本写入失败（webview 将不带 preload）：${e instanceof Error ? e.message : String(e)}`,
+		);
+		return null;
+	}
+}
+
+/**
  * UA for plugin-process data requests — now shared with the media downloader
  * via wire.ts (single source of truth; same verbatim reference value).
  */
@@ -332,6 +396,15 @@ export class RedNoteSession {
 	private container: HTMLElement | null = null;
 	private webview: WebviewEl | null = null;
 	private readyPromise: Promise<void> | null = null;
+	/**
+	 * file:// URL of the userAgentData-spoofing preload script (written by
+	 * main.ts onload via ensureWebviewPreloadFile). Null -> webviews run
+	 * WITHOUT preload (the previous behavior). Applied to BOTH webviews —
+	 * the login modal's fresh element AND this resident sign webview — so
+	 * their page environments stay identical (the sign path itself does not
+	 * depend on userAgentData; consistency is harmless).
+	 */
+	webviewPreloadUrl: string | null = null;
 
 	constructor() {
 		// MUST happen before the first webview creation so our partition is
@@ -394,6 +467,13 @@ export class RedNoteSession {
 		// attribute now actually applies and XHS sees a genuine Chrome UA.
 		el.setAttribute("useragent", CHROME_UA);
 		el.setAttribute("partition", WEBVIEW_PARTITION);
+		// Preload spoof (short-strip final fix): fake navigator.userAgentData
+		// for the UA + userAgentData dual fingerprint (see UA_SPOOF_PRELOAD_JS).
+		// Must be part of the pre-attach attribute batch — the webview is
+		// attribute-driven and post-attach changes do not re-create the guest.
+		if (this.webviewPreloadUrl) {
+			el.setAttribute("webpreferences", `preload=${this.webviewPreloadUrl}`);
+		}
 		// Role marker: separates this RESIDENT sign webview from the login
 		// view's fresh webview (data-pull-role="login", same partition) so the
 		// reclaim query above can only ever adopt an element of THIS role.

@@ -84,6 +84,8 @@ function makeSession(opts: {
 	boards?: RedNoteBoard[];
 	boardPages?: Record<string, FakePage[]>;
 	flatPages: FakePage[];
+	/** Per-note detail payload overrides (the detail title is authoritative). */
+	details?: Record<string, Record<string, unknown>>;
 }): SessionHarness {
 	const logs: string[] = [];
 	const detailCalls: string[] = [];
@@ -117,7 +119,7 @@ function makeSession(opts: {
 		},
 		fetchNoteDetail: async (noteId: string): Promise<Record<string, unknown>> => {
 			detailCalls.push(noteId);
-			return detailOf(noteId);
+			return opts.details?.[noteId] ?? detailOf(noteId);
 		},
 		mergeCard: (c: RedNoteRaw, d: Record<string, unknown> | null): RedNoteRaw =>
 			mergeNoteCard(c, d),
@@ -393,5 +395,95 @@ describe("syncFavorites baseline (guard against regressions)", () => {
 		expect(result.added).toBe(2);
 		expect(result.newNoteIds.sort()).toEqual(["W1", "W2"]);
 		expect(h.logs.some((l) => l.includes("增量停止于"))).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// 收藏夹分目录 (collection subdirectory layout)
+// ---------------------------------------------------------------------------
+
+describe("syncFavorites collection layout", () => {
+	it("board notes go under a cleaned collection folder; flat notes stay at the notes root", async () => {
+		const h = makeSession({
+			boards: [{ board_id: "B1", name: "美食/旅行", raw: {} }],
+			boardPages: {
+				B1: [{ items: [card("G1")], has_more: false, cursor: "" }],
+			},
+			flatPages: [{ items: [card("F1")], has_more: false, cursor: "" }],
+		});
+		const { vault, files } = makeVault();
+
+		const result = await syncFavorites(vault, h.session, baseOpts({}, {}));
+
+		// "美食/旅行" cleans like a file name (Windows-invalid "/" stripped);
+		// the flat card (collection "") lands in the notes-folder root.
+		expect([...files.keys()].sort()).toEqual([
+			"RedNote/Bookmarks/t-F1.md",
+			"RedNote/Bookmarks/美食旅行/t-G1.md",
+		]);
+		expect(result.added).toBe(2);
+	});
+
+	it("same-title notes in different collections and at the root do NOT collide (per-directory namespaces)", async () => {
+		const sameTitle = (id: string): RedNoteRaw => ({ ...card(id), title: "同题" });
+		const h = makeSession({
+			boards: [
+				{ board_id: "B1", name: "夹一", raw: {} },
+				{ board_id: "B2", name: "夹二", raw: {} },
+			],
+			boardPages: {
+				B1: [{ items: [sameTitle("A1")], has_more: false, cursor: "" }],
+				B2: [{ items: [sameTitle("A2")], has_more: false, cursor: "" }],
+			},
+			flatPages: [{ items: [sameTitle("A3")], has_more: false, cursor: "" }],
+			// The merged DETAIL title is authoritative — keep it identical too.
+			details: {
+				A1: { ...detailOf("A1"), title: "同题" },
+				A2: { ...detailOf("A2"), title: "同题" },
+				A3: { ...detailOf("A3"), title: "同题" },
+			},
+		});
+		const { vault, files } = makeVault();
+		const indexed = new Map<string, string>();
+
+		await syncFavorites(vault, h.session, baseOpts({}, {
+			onNoteIndexed: (id, _hash, file) => {
+				indexed.set(id, file);
+			},
+		}));
+
+		// All three resolve to the bare "同题.md" INSIDE THEIR OWN directory,
+		// and the index records those per-collection paths.
+		expect([...files.keys()].sort()).toEqual([
+			"RedNote/Bookmarks/同题.md",
+			"RedNote/Bookmarks/夹一/同题.md",
+			"RedNote/Bookmarks/夹二/同题.md",
+		]);
+		expect(indexed.get("A1")).toBe("RedNote/Bookmarks/夹一/同题.md");
+		expect(indexed.get("A2")).toBe("RedNote/Bookmarks/夹二/同题.md");
+		expect(indexed.get("A3")).toBe("RedNote/Bookmarks/同题.md");
+	});
+
+	it("same-title notes within the SAME collection still get the id suffix", async () => {
+		const sameTitle = (id: string): RedNoteRaw => ({ ...card(id), title: "同题" });
+		const h = makeSession({
+			boards: [{ board_id: "B1", name: "夹一", raw: {} }],
+			boardPages: {
+				B1: [{ items: [sameTitle("A1"), sameTitle("A2")], has_more: false, cursor: "" }],
+			},
+			flatPages: [{ items: [], has_more: false, cursor: "" }],
+			details: {
+				A1: { ...detailOf("A1"), title: "同题" },
+				A2: { ...detailOf("A2"), title: "同题" },
+			},
+		});
+		const { vault, files } = makeVault();
+
+		await syncFavorites(vault, h.session, baseOpts({}, {}));
+
+		expect([...files.keys()].sort()).toEqual([
+			"RedNote/Bookmarks/夹一/同题-A2.md",
+			"RedNote/Bookmarks/夹一/同题.md",
+		]);
 	});
 });

@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { cleanNoteFileName, resolveNoteFileName } from "../src/rednote/filename";
+import {
+	cleanCollectionFolderName,
+	cleanNoteFileName,
+	resolveNoteFileName,
+} from "../src/rednote/filename";
 
 describe("cleanNoteFileName", () => {
 	it("strips all Windows-invalid characters", () => {
@@ -21,6 +25,32 @@ describe("cleanNoteFileName", () => {
 
 	it("handles unicode titles without mangling", () => {
 		expect(cleanNoteFileName("周末去哪喝咖啡", "id")).toBe("周末去哪喝咖啡");
+	});
+});
+
+describe("cleanCollectionFolderName (收藏夹目录名)", () => {
+	it("cleans like a file name: Windows-invalid chars stripped, whitespace collapsed", () => {
+		expect(cleanCollectionFolderName(`a/b\\c:d*e?f"g<h>i|j`)).toBe("abcdefghij");
+		expect(cleanCollectionFolderName("  美食   旅行  ")).toBe("美食 旅行");
+	});
+
+	it("appends an underscore to Windows-reserved device names (case-insensitive)", () => {
+		expect(cleanCollectionFolderName("CON")).toBe("CON_");
+		expect(cleanCollectionFolderName("nul")).toBe("nul_");
+		expect(cleanCollectionFolderName("Lpt2")).toBe("Lpt2_");
+	});
+
+	it("guards the reserved stem even before a dot suffix", () => {
+		expect(cleanCollectionFolderName("CON.txt")).toBe("CON_.txt");
+	});
+
+	it("falls back to a placeholder when the name cleans to empty", () => {
+		expect(cleanCollectionFolderName("???***")).toBe("未命名收藏夹");
+		expect(cleanCollectionFolderName("")).toBe("未命名收藏夹");
+	});
+
+	it("keeps normal names untouched", () => {
+		expect(cleanCollectionFolderName("周末去哪喝咖啡")).toBe("周末去哪喝咖啡");
 	});
 });
 
