@@ -94,7 +94,10 @@ export class RedNoteLoginModal extends Modal {
 
 		this.stageEl = contentEl.createDiv();
 		this.stageEl.addClass("pull-rednote-login-stage");
-		this.stageEl.style.cssText = "flex:1 1 auto;position:relative;min-height:200px;";
+		// Explicit stage height (not flex-grow): the modal's flex chain plus
+		// Obsidian's webview stylesheet rules are what collapsed the element
+		// to a 140px strip for its entire existence.
+		this.stageEl.style.cssText = `position:relative;height:${LOGIN_WEBVIEW_HEIGHT_PX}px;flex:none;`;
 
 		this.mountWebView(this.session.webviewPreloadUrl != null);
 
@@ -135,11 +138,16 @@ export class RedNoteLoginModal extends Modal {
 		// Role marker: keeps the session's partition-scoped reclaim query from
 		// ever adopting THIS element as the sign webview (see api.ts).
 		wv.setAttribute("data-pull-role", "login");
-		// The commercial plugin's fixed sizing: a brand-new VISIBLE element at
-		// a fixed height needs no kick/reload/zoom — the guest viewport is
-		// correct from the very first attach.
+		// The commercial plugin's fixed sizing, hardened against Obsidian's own
+		// app.css rule `.webviewer-content webview { flex-grow:1; width:100% }`
+		// (NO height — inside a flex chain an inline height gets eaten and the
+		// element collapses to content height ≈ 140px, the long "short strip"
+		// saga). !important inline beats any stylesheet; the stage also gets
+		// an explicit height so no flex sizing of the element is ever needed.
 		wv.style.cssText =
-			`width:100%;height:${LOGIN_WEBVIEW_HEIGHT_PX}px;display:block;border:none;`;
+			`width:100% !important;height:${LOGIN_WEBVIEW_HEIGHT_PX}px !important;` +
+			`min-height:${LOGIN_WEBVIEW_HEIGHT_PX}px !important;` +
+			`display:block !important;border:none;`;
 		// Same element-level deny as the sign webview: our clean partition is
 		// outside Obsidian's per-session permission sandbox.
 		wv.addEventListener("permissionrequest", (e: Event) => {

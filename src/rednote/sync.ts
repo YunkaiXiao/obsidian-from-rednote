@@ -500,6 +500,24 @@ export async function syncFavorites(
 	}
 	result.boardsFetched = boards.length;
 
+	// Pre-create every board's folder up front (user request): the vault tree
+	// mirrors the collection structure from the moment the boards are known,
+	// even before any of their notes are reached (or when a board holds only
+	// already-synced notes that incremental-stop skips instantly).
+	for (const board of boards) {
+		const folder = cleanCollectionFolderName(board.name);
+		if (!folder) {
+			continue;
+		}
+		try {
+			await ensureFolderPath(vault, `${opts.notesFolder}/${folder}`);
+		} catch (e) {
+			session.log(
+				`收藏夹目录预创建失败（忽略，写笔记时会重试）：${folder} ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+
 	for (const board of boards) {
 		let boardCards = 0;
 		let boardCursor = "";
