@@ -70,9 +70,16 @@ export const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identit
  * requests (Obsidian's per-partition webRequest hook deletes those headers
  * and rewrites the UA — the root cause of the permanent HTTP 406s).
  */
+/**
+ * Webview UA — pinned to the macOS Chrome 120 string the working commercial
+ * plugin uses for its login webview. The XHS page serves a different layout
+ * per UA/platform fingerprint, and newer Windows-Chrome UAs yielded a page
+ * that renders only a ~140px strip inside the guest viewport (the long
+ * "short strip" saga); Chrome/120 macOS renders the full-height page.
+ */
 export const CHROME_UA =
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " +
-	"Chrome/153.0.0.0 Safari/537.36";
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+	"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /**
  * UA for plugin-process data requests — now shared with the media downloader
