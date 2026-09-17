@@ -15,6 +15,9 @@ export const COLLECT_PAGE_NUM = 30;
 /** `num` parameter of the board (收藏夹) note-list endpoint (M3.1). */
 export const BOARD_NOTE_NUM = 30;
 
+/** `num` parameter of the board/user (收藏夹列表) endpoint. */
+export const BOARD_USER_NUM = 30;
+
 /**
  * UA for plugin-process data requests AND CDN media downloads — the reference
  * implementation's Edge 142 UA, copied verbatim. Defined here (pure module)
@@ -74,6 +77,30 @@ export function buildBoardNoteParams(
 		params.cursor = cursor;
 	}
 	params.num = String(num);
+	return params;
+}
+
+/**
+ * Ordered GET params for /api/sns/web/v1/board/user, matching the commercial
+ * plugin's deobfuscated query VERBATIM: user_id -> page -> num=30 ->
+ * image_formats=jpg,webp,avif (same literal as collect/page; commas stay
+ * literal) -> xsec_token (EMPTY) -> xsec_source (EMPTY). The empty xsec
+ * params are present-but-blank in the reference's requests; object insertion
+ * order IS the wire order (and the signed content string's order). Omitting
+ * everything after user_id made the endpoint answer code:-1 with an empty
+ * msg (success=false).
+ *
+ * @param userId the logged-in user's id
+ * @param page   1-based page number (the reference's default value
+ *               deobfuscates to 1)
+ */
+export function buildBoardUserParams(userId: string, page: number = 1): Record<string, string> {
+	const params: Record<string, string> = { user_id: userId };
+	params.page = String(page);
+	params.num = String(BOARD_USER_NUM);
+	params.image_formats = COLLECT_IMAGE_FORMATS;
+	params.xsec_token = "";
+	params.xsec_source = "";
 	return params;
 }
 

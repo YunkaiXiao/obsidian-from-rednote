@@ -1,7 +1,7 @@
 /* Pull Rednote plugin styles */
 
-/* Login leaf layout (fixed-size scheme): the webview element itself carries
-   the proven inline style (width:100%; height:560px; display:block) and is
+/* Login modal layout (fixed-size scheme): the webview element itself carries
+   the proven inline style (width:100%; height:520px; display:block) and is
    created fresh in onOpen / destroyed in onClose (login.ts). The stage is
    just a relative flow box holding it — no absolute fill, no dynamic sizing,
    no container layer (the old -container/-webview rules are gone with the

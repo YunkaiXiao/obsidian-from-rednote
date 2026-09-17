@@ -48,6 +48,7 @@ import { xhsSign, xhsSignXyw, generateB1 } from "./sign";
 import { signRequest } from "./sign-ref";
 import {
 	buildBoardNoteParams,
+	buildBoardUserParams,
 	buildCollectPageParams,
 	buildGetQueryString,
 	extractCookieValue,
@@ -59,7 +60,7 @@ import {
 } from "./wire";
 
 /** The partition isolates this session from Obsidian's default browser session.
- * SHARED with the login view's fresh webview (RedNoteLoginView) — the shared
+ * SHARED with the login modal's fresh webview (RedNoteLoginModal) — the shared
  * cookie store is what makes a login there instantly visible here. */
 export const WEBVIEW_PARTITION = "persist:rednote-sync-v2"; // v2: fresh identity — the v1 partition's a1 got server-flagged after 2 days of debug traffic
 /**
@@ -314,7 +315,7 @@ export class FetchError extends Error {
  * marked data-pull-role="sign"). Removing it would drop the session and
  * require a re-login. `destroy()` removes it only on plugin unload.
  *
- * It is a DIFFERENT element from the login view's webview (RedNoteLoginView):
+ * It is a DIFFERENT element from the login modal's webview (RedNoteLoginModal):
  * that one is created fresh on every open, marked data-pull-role="login",
  * destroyed on close, and never traded between parents. The two share only
  * the persist: partition — its cookie store makes a login in the visible
@@ -358,9 +359,9 @@ export class RedNoteSession {
 		}
 		// RECLAIM before creating: adopt a live SIGN webview if one exists
 		// without session refs (e.g. after a destroy/recreate edge). The
-		// [data-pull-role="sign"] filter is LOAD-BEARING: the login view's
+		// [data-pull-role="sign"] filter is LOAD-BEARING: the login modal's
 		// fresh webview carries the SAME partition but data-pull-role="login"
-		// and is owned (created/destroyed) by RedNoteLoginView — adopting it
+		// and is owned (created/destroyed) by RedNoteLoginModal — adopting it
 		// here would yank the visible login page into the offscreen parking
 		// container and corrupt the sign session in one step.
 		const existing = document.querySelector(
@@ -1744,18 +1745,23 @@ export class RedNoteSession {
 	/**
 	 * Fetch the user's 收藏夹 (boards) list.
 	 * Endpoint (deobfuscation-confirmed): GET /api/sns/web/v1/board/user
-	 *   ?user_id=…  ->  data.boards[]
+	 *   ?user_id=…&page=…&num=30&image_formats=jpg,webp,avif&xsec_token=&xsec_source=
+	 *   ->  data.boards[]
+	 * The commercial plugin's FULL query shape is REQUIRED: sending user_id
+	 * alone made the endpoint answer code:-1 / success=false (empty msg).
 	 * The response shape of the board endpoints is the least-verified part of
 	 * this pipeline, so the RAW data block is logged ONCE per call (truncated)
 	 * and parsing is tolerant (see parseBoardList): the name field key varies
 	 * across payloads (board_name / name / title).
 	 */
-	async fetchUserBoards(userId: string): Promise<RedNoteBoard[]> {
+	async fetchUserBoards(userId: string, page: number = 1): Promise<RedNoteBoard[]> {
 		let data: Record<string, unknown>;
 		try {
-			data = await this.request("GET", "/api/sns/web/v1/board/user", {
-				user_id: userId,
-			});
+			data = await this.request(
+				"GET",
+				"/api/sns/web/v1/board/user",
+				buildBoardUserParams(userId, page),
+			);
 		} catch (e) {
 			// M3.2 diagnostics: the endpoint can fail at the BUSINESS layer with
 			// HTTP 200 (observed live: code=-1 success=false — signature passes,

@@ -1,13 +1,23 @@
-// Login page hosted in a WORKSPACE LEAF (ItemView) — the Surfing-proven host.
+// Login page hosted in an Obsidian MODAL (the commercial plugin's host).
 //
-// Login webview rebuild (aligned with the deobfuscated commercial plugin):
+// Login webview scheme (aligned with the deobfuscated commercial plugin):
 // every OPEN creates a FRESH <webview> element with the proven fixed inline
-// style (width:100%; height:560px), mounts it DIRECTLY into the visible leaf
-// stage, and every CLOSE destroys it. The element is never reparented and
-// never parked offscreen — the guest attaches to an already visible, already
-// correctly sized element, so the old "short strip" defect (guest viewport
-// frozen at its attach-time size after leaf ↔ offscreen body round-trips)
-// cannot occur, and none of the old kick/reload/zoom workarounds exist here.
+// style (width:100%; height:520px), mounts it DIRECTLY into the visible
+// modal content, and every CLOSE destroys it. The element is never
+// reparented and never parked offscreen — the guest attaches to an already
+// visible, already correctly sized element, so the old "short strip" defect
+// (guest viewport frozen at its attach-time size) cannot occur, and none of
+// the old kick/reload/zoom workarounds exist here.
+//
+// Why a Modal (and not the previous workspace leaf): inside a leaf the same
+// fixed-size webview rendered as a ~700x150 strip — the leaf's nested
+// .workspace-leaf -> .view-content containment/overflow chain fights the
+// inline size, while a plain Modal shows it full size (the commercial plugin
+// hosts the identical scheme in a Modal with maxWidth 850px). The original
+// reason to reject Modal — the reparent crash of a RESIDENT webview being
+// moved in and out (Electron #38996/#38603) — does not apply to this scheme:
+// the element is created fresh here and destroyed on close, never moved
+// between parents.
 //
 // The SIGN webview (src/rednote/api.ts, ensureWebviewElement) is a separate,
 // hidden, resident element marked data-pull-role="sign" sharing the same
@@ -16,19 +26,21 @@
 // against the sign webview, so a completed QR login up here is visible there
 // immediately through the shared cookie store.
 
-import { ItemView, Notice } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
 import { CHROME_UA, INDEX_URL, WEBVIEW_PARTITION, RedNoteSession } from "./api";
 
-export const LOGIN_LEAF_VIEW_TYPE = "pull-rednote-login";
-
-/** Padding (px) applied to the leaf content element in onOpen. */
+/** Padding (px) applied to the modal content element in onOpen. */
 const CONTENT_PADDING_PX = 8;
-/** Fixed login webview height (px) — the commercial plugin's scheme uses 500. */
-const LOGIN_WEBVIEW_HEIGHT_PX = 560;
+/** Fixed login webview height (px) — 520: between the commercial plugin's 500 and our previous 560. */
+const LOGIN_WEBVIEW_HEIGHT_PX = 520;
+/** Modal content max width (px) — the commercial plugin's login modal cap. */
+const LOGIN_MODAL_MAX_WIDTH_PX = 850;
 
-export class RedNoteLoginView extends ItemView {
+export class RedNoteLoginModal extends Modal {
 	private session: RedNoteSession;
 	private onStateChange: () => void;
+	/** Called from onClose so the plugin can clear its re-entry guard. */
+	private onClosed: () => void;
 	private statusEl: HTMLElement | null = null;
 	private stageEl: HTMLElement | null = null;
 	/** The fresh webview element created in onOpen, destroyed in onClose. */
@@ -40,30 +52,22 @@ export class RedNoteLoginView extends ItemView {
 	private finished = false;
 
 	constructor(
-		leaf: import("obsidian").WorkspaceLeaf,
+		app: App,
 		session: RedNoteSession,
 		onStateChange: () => void,
+		onClosed: () => void,
 	) {
-		super(leaf);
+		super(app);
 		this.session = session;
 		this.onStateChange = onStateChange;
+		this.onClosed = onClosed;
 	}
 
-	getViewType(): string {
-		return LOGIN_LEAF_VIEW_TYPE;
-	}
-
-	getDisplayText(): string {
-		return "小红书登录";
-	}
-
-	getIcon(): string {
-		return "bookmark";
-	}
-
-	async onOpen(): Promise<void> {
+	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.empty();
+		// Modal width: the commercial plugin caps its login modal at 850px.
+		contentEl.style.maxWidth = `${LOGIN_MODAL_MAX_WIDTH_PX}px`;
 		contentEl.style.display = "flex";
 		contentEl.style.flexDirection = "column";
 		contentEl.style.padding = `${CONTENT_PADDING_PX}px`;
@@ -100,8 +104,9 @@ export class RedNoteLoginView extends ItemView {
 			(e as Event & { preventDefault?: () => void }).preventDefault?.();
 		});
 
-		// Mount into the VISIBLE leaf first; only then start the navigation,
-		// so the guest attaches at the final element size (100% × 560px).
+		// Mount into the VISIBLE modal content first; only then start the
+		// navigation, so the guest attaches at the final element size
+		// (100% × 520px).
 		this.stageEl.appendChild(wv);
 		this.wvEl = wv;
 
@@ -114,12 +119,12 @@ export class RedNoteLoginView extends ItemView {
 		void this.session.ensureWebview();
 	}
 
-	async onClose(): Promise<void> {
+	onClose(): void {
 		this.finished = true;
 		this.stopPolling();
 		this.clearWatchdog();
 		this.detachStatus();
-		// Destroy ONLY this view's fresh webview element (the leaf teardown
+		// Destroy ONLY this modal's fresh webview element (the modal teardown
 		// would remove it anyway; removing it here is explicit). The session's
 		// hidden sign webview — and the login cookies in the shared partition —
 		// stay untouched: there is no adopt/reclaim coupling to unwind.
@@ -128,6 +133,8 @@ export class RedNoteLoginView extends ItemView {
 			this.wvEl.remove();
 			this.wvEl = null;
 		}
+		// Let the plugin clear its re-entry guard (the modal is gone now).
+		this.onClosed();
 	}
 
 	private setStatus(text: string): void {
@@ -146,7 +153,7 @@ export class RedNoteLoginView extends ItemView {
 	}
 
 	/**
-	 * Load-state listeners for THIS view's webview only (status line). No page
+	 * Load-state listeners for THIS modal's webview only (status line). No page
 	 * hooks here: the request recorder (fetch/XHR interception + warmup) is a
 	 * duty of the SIGN webview and is installed through session.eval against
 	 * it — kept as before on did-finish-load (idempotent).

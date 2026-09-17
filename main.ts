@@ -10,7 +10,7 @@ import { App, Notice, Plugin, PluginSettingTab, Setting, ToggleComponent, TextCo
 import { RedNoteSession, cleanPartitionStatus } from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
-import { RedNoteLoginView, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
+import { RedNoteLoginModal } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
@@ -77,7 +77,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 	/** Shared webview session (used by the settings tab's logout button). */
 	readonly session = new RedNoteSession();
 	private syncing = false;
-	/** Guard against re-entrant login modals fighting over one resident webview. */
+	/** Guard against re-entrant login modals (one login webview at a time). */
+	private loginModalOpen = false;
 	/** Live settings tab reference so login-state changes can re-render it. */
 	private settingTab: RedNoteSyncSettingTab | null = null;
 
@@ -149,8 +150,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		// The login leaf (if open) is owned and disposed by the workspace.
-		// Tear down the resident/parked webview session last.
+		// The login modal's fresh webview dies with the app window (or in the
+		// modal's onClose). Tear down the resident/parked webview session last.
 		this.session.destroy();
 	}
 
@@ -178,25 +179,32 @@ export default class RedNoteSyncPlugin extends Plugin {
 		}
 	}
 
-	/** Open the login page in a workspace leaf (tab) and keep the session. */
+	/** Open the login page in a Modal and keep the session. */
 	openLogin(): void {
-		// ADR-013: the login page lives in an ItemView — Obsidian owns its whole
-		// lifecycle (we write no close/destroy code). The tab can be popped out
-		// into its own window and resized freely. Closing it destroys the
-		// webview element, which is fine: the login session persists in the
-		// partition and is lazily recreated for signed sync requests.
-		const existing = this.app.workspace.getLeavesOfType(LOGIN_LEAF_VIEW_TYPE);
-		const openLeaf = existing.length > 0 ? existing[0] : undefined;
-		if (openLeaf) {
-			this.app.workspace.setActiveLeaf(openLeaf);
+		// The login page lives in a Modal (the commercial plugin's host): the
+		// workspace leaf's nested .workspace-leaf -> .view-content containment
+		// chain squeezed the same fixed-size webview to a ~700x150 strip, while
+		// a plain Modal shows it full size. The modal is created fresh per open
+		// and destroyed on close — its webview element is never reparented, so
+		// the element-reuse crash premise that originally rejected Modal does
+		// not apply to this scheme. Closing it destroys the webview element,
+		// which is fine: the login session persists in the partition and is
+		// lazily recreated for signed sync requests.
+		if (this.loginModalOpen) {
+			new Notice("登录窗口已打开，请先在其中完成登录或关闭它");
 			return;
 		}
-		const leaf = this.app.workspace.getLeaf(true);
-		const view = new RedNoteLoginView(leaf, this.session, () => {
-			void this.updateLoginState(true);
-		});
-		leaf.open(view);
-		this.app.workspace.setActiveLeaf(leaf);
+		this.loginModalOpen = true;
+		new RedNoteLoginModal(
+			this.app,
+			this.session,
+			() => {
+				void this.updateLoginState(true);
+			},
+			() => {
+				this.loginModalOpen = false;
+			},
+		).open();
 	}
 
 	/**

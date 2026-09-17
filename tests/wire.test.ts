@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
 	buildBoardNoteParams,
+	buildBoardUserParams,
 	buildCollectPageParams,
 	buildGetQueryString,
 	joinCookies,
@@ -54,6 +55,45 @@ describe("buildBoardNoteParams (M3.1 board/note: board_id -> cursor -> num)", ()
 	it("serializes to the exact query the signature is computed over", () => {
 		expect(buildGetQueryString(buildBoardNoteParams("b/1", "c=2"))).toBe(
 			"board_id=b%2F1&cursor=c%3D2&num=30",
+		);
+	});
+});
+
+describe("buildBoardUserParams (board/user: user_id -> page -> num -> image_formats -> xsec_token -> xsec_source)", () => {
+	it("orders user_id -> page -> num=30 -> image_formats -> empty xsec params", () => {
+		const p = buildBoardUserParams("5a89c2c39e52e17b3b7f9403c", 2);
+		expect(Object.keys(p)).toEqual([
+			"user_id",
+			"page",
+			"num",
+			"image_formats",
+			"xsec_token",
+			"xsec_source",
+		]);
+		expect(p["user_id"]).toBe("5a89c2c39e52e17b3b7f9403c");
+		expect(p["page"]).toBe("2");
+		expect(p["num"]).toBe("30");
+		expect(p["image_formats"]).toBe("jpg,webp,avif");
+		expect(p["xsec_token"]).toBe("");
+		expect(p["xsec_source"]).toBe("");
+	});
+
+	it("defaults page to 1 (the commercial plugin's default page value)", () => {
+		const p = buildBoardUserParams("u1");
+		expect(Object.keys(p)).toEqual([
+			"user_id",
+			"page",
+			"num",
+			"image_formats",
+			"xsec_token",
+			"xsec_source",
+		]);
+		expect(p["page"]).toBe("1");
+	});
+
+	it("serializes to the exact query the signature is computed over (commas literal)", () => {
+		expect(buildGetQueryString(buildBoardUserParams("5a89c2c39e52e17b3b7f9403c", 1))).toBe(
+			"user_id=5a89c2c39e52e17b3b7f9403c&page=1&num=30&image_formats=jpg,webp,avif&xsec_token=&xsec_source=",
 		);
 	});
 });
