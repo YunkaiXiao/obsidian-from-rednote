@@ -99,7 +99,12 @@ export class RedNoteLoginModal extends Modal {
 		// to a 140px strip for its entire existence.
 		this.stageEl.style.cssText = `position:relative;height:${LOGIN_WEBVIEW_HEIGHT_PX}px;flex:none;`;
 
-		this.mountWebView(this.session.webviewPreloadUrl != null);
+		// NO preload on the LOGIN webview — verbatim commercial-plugin parity
+		// (its preload lives only on the hidden 1×1 SIGN webview). The login
+		// preload was the last attribute we set that the reference does not,
+		// and full-size rendering under it coincided with the 0x80000003
+		// host crash during page load.
+		this.mountWebView(false);
 
 		this.startPolling();
 		// Warm the hidden sign webview (the eval target for checkLogin and the
