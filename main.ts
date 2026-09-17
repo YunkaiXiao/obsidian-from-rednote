@@ -15,7 +15,7 @@ import {
 } from "./src/rednote/api";
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
-import { RedNoteLoginModal } from "./src/rednote/login";
+import { RedNoteLoginModal, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
@@ -195,32 +195,31 @@ export default class RedNoteSyncPlugin extends Plugin {
 		}
 	}
 
-	/** Open the login page in a Modal and keep the session. */
+	/** Open the login page in a workspace-leaf tab and keep the session. */
 	openLogin(): void {
-		// The login page lives in a Modal (the commercial plugin's host): the
-		// workspace leaf's nested .workspace-leaf -> .view-content containment
-		// chain squeezed the same fixed-size webview to a ~700x150 strip, while
-		// a plain Modal shows it full size. The modal is created fresh per open
-		// and destroyed on close — its webview element is never reparented, so
-		// the element-reuse crash premise that originally rejected Modal does
-		// not apply to this scheme. Closing it destroys the webview element,
-		// which is fine: the login session persists in the partition and is
-		// lazily recreated for signed sync requests.
-		if (this.loginModalOpen) {
-			new Notice("登录窗口已打开，请先在其中完成登录或关闭它");
+		// Back on the leaf host (user decision): the Modal host crashed the
+		// Obsidian process (0x80000003) a few seconds after the QR appeared at
+		// full size, across preload/no-preload and deferred-destroy variants —
+		// the leaf never crashed. The short-strip defect is NOT container-
+		// dependent (it was the src/mount attribute order, since fixed), so a
+		// leaf + fresh-fixed-size-webview should render full size AND stay
+		// stable. Reuses the open leaf if present.
+		const existing = this.app.workspace.getLeavesOfType(LOGIN_LEAF_VIEW_TYPE);
+		const openLeaf = existing.length > 0 ? existing[0] : undefined;
+		if (openLeaf) {
+			this.app.workspace.setActiveLeaf(openLeaf);
 			return;
 		}
-		this.loginModalOpen = true;
-		new RedNoteLoginModal(
-			this.app,
+		const leaf = this.app.workspace.getLeaf(true);
+		const view = new RedNoteLoginModal(
+			leaf,
 			this.session,
 			() => {
 				void this.updateLoginState(true);
 			},
-			() => {
-				this.loginModalOpen = false;
-			},
-		).open();
+		);
+		leaf.open(view);
+		this.app.workspace.setActiveLeaf(leaf);
 	}
 
 	/**

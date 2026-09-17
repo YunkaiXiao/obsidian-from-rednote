@@ -36,7 +36,7 @@
 // against the sign webview, so a completed QR login up here is visible there
 // immediately through the shared cookie store.
 
-import { App, Modal, Notice } from "obsidian";
+import { ItemView, Notice, WorkspaceLeaf } from "obsidian";
 import { CHROME_UA, INDEX_URL, WEBVIEW_PARTITION, RedNoteSession } from "./api";
 
 /** Padding (px) applied to the modal content element in onOpen. */
@@ -46,11 +46,11 @@ const LOGIN_WEBVIEW_HEIGHT_PX = 520;
 /** Modal content max width (px) — the commercial plugin's login modal cap. */
 const LOGIN_MODAL_MAX_WIDTH_PX = 850;
 
-export class RedNoteLoginModal extends Modal {
+export const LOGIN_LEAF_VIEW_TYPE = "pull-rednote-login";
+
+export class RedNoteLoginModal extends ItemView {
 	private session: RedNoteSession;
 	private onStateChange: () => void;
-	/** Called from onClose so the plugin can clear its re-entry guard. */
-	private onClosed: () => void;
 	private statusEl: HTMLElement | null = null;
 	private stageEl: HTMLElement | null = null;
 	/** The fresh webview element created in onOpen, destroyed in onClose. */
@@ -66,22 +66,32 @@ export class RedNoteLoginModal extends Modal {
 	private finished = false;
 
 	constructor(
-		app: App,
+		leaf: WorkspaceLeaf,
 		session: RedNoteSession,
 		onStateChange: () => void,
-		onClosed: () => void,
 	) {
-		super(app);
+		super(leaf);
 		this.session = session;
 		this.onStateChange = onStateChange;
-		this.onClosed = onClosed;
 	}
 
-	onOpen(): void {
+	getViewType(): string {
+		return LOGIN_LEAF_VIEW_TYPE;
+	}
+
+	getDisplayText(): string {
+		return "小红书登录";
+	}
+
+	getIcon(): string {
+		return "bookmark";
+	}
+
+	async onOpen(): Promise<void> {
 		const { contentEl } = this;
 		contentEl.empty();
-		// Modal width: the commercial plugin caps its login modal at 850px.
 		contentEl.style.maxWidth = `${LOGIN_MODAL_MAX_WIDTH_PX}px`;
+		contentEl.style.margin = "0 auto";
 		contentEl.style.display = "flex";
 		contentEl.style.flexDirection = "column";
 		contentEl.style.padding = `${CONTENT_PADDING_PX}px`;
@@ -193,7 +203,7 @@ export class RedNoteLoginModal extends Modal {
 		}, 50);
 	}
 
-	onClose(): void {
+	async onClose(): Promise<void> {
 		this.finished = true;
 		this.stopPolling();
 		this.clearWatchdog();
@@ -215,9 +225,7 @@ export class RedNoteLoginModal extends Modal {
 				}
 			}, 50);
 		}
-		// Let the plugin clear its re-entry guard (the modal is gone now).
-		this.onClosed();
-	}
+}
 
 	private setStatus(text: string): void {
 		if (this.statusEl?.getText() === text) {
