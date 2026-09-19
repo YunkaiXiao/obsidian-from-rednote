@@ -450,6 +450,10 @@ export async function analyzeImages(
 		const url = `${(baseUrl ?? "").replace(/\/+$/, "")}/chat/completions`;
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
+			// Explicit Content-Length: without it Node switches to chunked
+			// transfer-encoding, which many simple model servers cannot parse
+			// (observed: HTTP 400 "invalid JSON char 0" + ECONNRESET).
+			"Content-Length": String(Buffer.byteLength(body, "utf8")),
 		};
 		if (apiKey) {
 			headers["Authorization"] = `Bearer ${apiKey}`;
