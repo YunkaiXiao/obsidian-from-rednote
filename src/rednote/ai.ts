@@ -345,8 +345,11 @@ export function chunkArray<T>(items: readonly T[], size: number): T[][] {
 // ---------------------------------------------------------------------------
 
 /**
- * Plain Node HTTPS POST of a JSON body (independent of api.ts's
- * nodeHttpsJson per task contract; 60s timeout, fresh agent per request).
+ * Plain Node POST of a JSON body. Protocol-aware: an http:// base URL (e.g. a
+ * LAN-hosted model service like http://192.168.x.x:8010/v1) MUST go through
+ * the http module — forcing https turned every request into ECONNREFUSED on
+ * :443 (observed on first real-device run). https:// URLs use the https
+ * module as before. 60s timeout, fresh agent per request.
  */
 function httpsPostJson(
 	url: string,
@@ -357,15 +360,20 @@ function httpsPostJson(
 		try {
 			const reqquire = (window as unknown as { require?: (m: string) => unknown })
 				.require;
-			const https = reqquire?.("https") as typeof import("https") | undefined;
-			if (!https) {
-				reject(new Error("Node https 模块不可用"));
+			const u = new URL(url);
+			const isTls = u.protocol === "https:";
+			const mod = reqquire?.(isTls ? "https" : "http") as
+				| typeof import("https")
+				| typeof import("http")
+				| undefined;
+			if (!mod) {
+				reject(new Error("Node http(s) 模块不可用"));
 				return;
 			}
-			const u = new URL(url);
-			const req = https.request(
+			const req = mod.request(
 				{
 					hostname: u.hostname,
+					port: u.port || (isTls ? 443 : 80),
 					path: u.pathname + u.search,
 					method: "POST",
 					headers,
