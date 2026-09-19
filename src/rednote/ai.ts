@@ -16,8 +16,11 @@
 
 /** Chinese prompt sent with every image batch (task contract wording). */
 export const IMAGE_ANALYSIS_PROMPT =
-	"请分析这组小红书笔记图片，输出：1) 图片内容概述；2) 图中关键文字（OCR）；3) 要点列表。" +
-	"用简洁中文回答，总长度不超过 200 字。";
+	"你收到的是一个小红书笔记的全部图片。请按以下步骤输出：\n" +
+	"1. 【图中文字】逐张完整转录图中可见的全部文字（OCR，保留原文，含图中标注/水印文字；每张图用「图N：」开头；某张图无文字则写「图N：（无文字）」）\n" +
+	"2. 【图片内容概述】这组图片整体展示了什么\n" +
+	"3. 【要点】3-5 条要点\n" +
+	"全文中文，简洁。";
 
 /** Frontmatter section marker written by this module. */
 export const AI_SECTION_IMAGE = "image_analysis";
@@ -34,7 +37,9 @@ const VIDEO_SUBHEADING = "### 视频转写";
 
 /** Chinese prompt sent with every video transcription call (task contract wording). */
 export const VIDEO_ANALYSIS_PROMPT =
-	"转写并总结这个小红书视频：1) 完整中文转录稿（保留口语）；2) 三句话摘要。";
+	"转写并总结这个小红书视频：1) 完整中文转录稿（保留口语）；2) 三句话摘要；\n" +
+	"3. 【关键时刻】列出 3-5 个最值得截图的关键时间点，JSON 数组格式 " +
+	'[{"t": 秒数, "why": "一句话"}]，放在输出末尾的 ```json 代码块中';
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -164,8 +169,10 @@ export function parseChatCompletion(
 /**
  * Extract LOCAL media image paths embedded in a rendered note body:
  * markdown images `![](...)` whose target starts with `mediaPrefix`
- * (e.g. "RedNote/Media"). Remote URLs are ignored. Order-preserving,
- * deduplicated. Pure.
+ * (e.g. "RedNote/Media"). Remote URLs are ignored. Embed targets are written
+ * vault-absolute ("/RedNote/Media/...") for Obsidian link resolution — the
+ * leading "/" is stripped here so the result is the vault-relative ADAPTER
+ * path. Order-preserving, deduplicated. Pure.
  */
 export function extractLocalImagePaths(markdown: string, mediaPrefix: string): string[] {
 	const out: string[] = [];
@@ -183,6 +190,8 @@ export function extractLocalImagePaths(markdown: string, mediaPrefix: string): s
 		} catch {
 			/* keep raw path */
 		}
+		// Vault-absolute embed ("/RedNote/Media/...") -> adapter-relative.
+		p = p.replace(/^\/+/, "");
 		if (!p.startsWith(mediaPrefix) || seen.has(p)) {
 			continue;
 		}
@@ -190,6 +199,20 @@ export function extractLocalImagePaths(markdown: string, mediaPrefix: string): s
 		out.push(p);
 	}
 	return out;
+}
+
+/**
+ * Read a single-line frontmatter field value (double-quoted or bare).
+ * Returns "" when absent. Pure.
+ */
+export function frontmatterStringValue(content: string, key: string): string {
+	const fm = matchFrontmatter(content);
+	if (!fm) {
+		return "";
+	}
+	const m = fm.body.match(new RegExp(`^${key}:\\s*(.*)$`, "m"));
+	const raw = (m?.[1] ?? "").trim();
+	return raw.replace(/^["']|["']$/g, "");
 }
 
 /**
@@ -378,6 +401,118 @@ export function applyVideoTranscript(
 	text: string,
 ): string {
 	return applyAiSubsection(content, model, AI_SECTION_VIDEO, VIDEO_SUBHEADING, text);
+}
+
+/** One AI-suggested key frame of a video note. */
+export interface VideoKeyMoment {
+	/** Seconds into the video. */
+	t: number;
+	/** One-sentence reason. */
+	why: string;
+}
+
+/** The `### 关键帧` subsection heading. */
+const KEYFRAMES_SUBHEADING = "### 关键帧";
+
+/**
+ * Extract the trailing ```json code block's key-moments array from a video
+ * transcription text. Tolerant: any malformed shape is ignored ([]) and the
+ * text is returned unchanged; a successfully parsed block is STRIPPED from
+ * the text so the note keeps only the prose. Pure, never throws.
+ */
+export function parseVideoKeyMoments(
+	text: string,
+): { text: string; keyMoments: VideoKeyMoment[] } {
+	const source = text ?? "";
+	const re = /```json\s*([\s\S]*?)```/;
+	const m = source.match(re);
+	const body = m?.[1];
+	if (!body) {
+		return { text: source, keyMoments: [] };
+	}
+	let moments: VideoKeyMoment[] = [];
+	try {
+		const parsed = JSON.parse(body) as unknown;
+		if (Array.isArray(parsed)) {
+			moments = parsed
+				.map((item): VideoKeyMoment | null => {
+					const it = item as { t?: unknown; why?: unknown };
+					const t = typeof it?.t === "number" ? it.t : Number(it?.t);
+					const why = typeof it?.why === "string" ? it.why : "";
+					return Number.isFinite(t) && t >= 0 && why ? { t, why } : null;
+				})
+				.filter((x): x is VideoKeyMoment => x !== null);
+		}
+	} catch {
+		moments = [];
+	}
+	if (moments.length === 0) {
+		return { text: source, keyMoments: [] };
+	}
+	const stripped = source.replace(re, "").replace(/\n+$/, "\n");
+	return { text: stripped, keyMoments: moments };
+}
+
+/**
+ * Render the `### 关键帧` subsection body: one embed line per extracted
+ * frame, embed targets vault-absolute ("/{mediaFolder}/{noteId}/kf-...").
+ * Returns "" for an empty moment list. Pure.
+ */
+export function renderKeyFramesSection(
+	keyMoments: readonly VideoKeyMoment[],
+	noteId: string,
+	mediaFolder: string,
+): string {
+	const moments = keyMoments ?? [];
+	if (moments.length === 0) {
+		return "";
+	}
+	const cleanFolder = (mediaFolder ?? "").replace(/^\/+|\/+$/g, "");
+	const lines = moments.map((km, i) => {
+		const path = `/${cleanFolder}/${noteId}/kf-${i + 1}-${km.t}s.jpg`;
+		return `- ![关键帧${km.t}s](${path})（${km.why}）`;
+	});
+	return `${KEYFRAMES_SUBHEADING}\n${lines.join("\n")}`;
+}
+
+/**
+ * Append (or replace) the `### 关键帧` subsection immediately after the
+ * `### 视频转写` block (or at the end of the AI section when no transcript
+ * block exists). Pure and idempotent. Returns content unchanged when the
+ * rendered section is empty.
+ */
+export function applyKeyFrames(
+	content: string,
+	keyMoments: readonly VideoKeyMoment[],
+	noteId: string,
+	mediaFolder: string,
+): string {
+	const block = renderKeyFramesSection(keyMoments, noteId, mediaFolder);
+	if (!block) {
+		return content;
+	}
+	let out = content ?? "";
+	// Replace an existing 关键帧 block (up to the next `### ` / EOF).
+	const existingIdx = out.indexOf(`\n${KEYFRAMES_SUBHEADING}`);
+	if (existingIdx >= 0) {
+		let next = out.length;
+		const following = out.slice(existingIdx + 1).indexOf("\n### ");
+		if (following >= 0) {
+			next = existingIdx + 1 + following + 1;
+		}
+		return `${out.slice(0, existingIdx + 1)}${block}\n${out.slice(next).replace(/^\n+/, "")}`;
+	}
+	// Insert after the 视频转写 block when present.
+	const videoIdx = out.indexOf(`\n${VIDEO_SUBHEADING}`);
+	if (videoIdx >= 0) {
+		let insertAt = out.length;
+		const following = out.slice(videoIdx + 1).indexOf("\n### ");
+		if (following >= 0) {
+			insertAt = videoIdx + 1 + following + 1;
+		}
+		return `${out.slice(0, insertAt).replace(/\n*$/, "\n")}\n${block}\n${out.slice(insertAt).replace(/^\n+/, "")}`;
+	}
+	return `${out.replace(/\n*$/, "\n")}\n${block}`;
 }
 
 /**
@@ -576,13 +711,18 @@ export async function analyzeImages(
  * Shares analyzeImages' transport/timeout/error/parse handling: never throws,
  * failures come back as `{ error }`. No adapter needed — the video is not
  * downloaded, the URL is passed straight through.
+ *
+ * On success the trailing ```json key-moments block (per VIDEO_ANALYSIS_PROMPT)
+ * is parsed out of the text: `keyMoments` carries the parsed array (absent
+ * when the model returned none / a malformed block) and `text` has the block
+ * stripped so only prose reaches the note.
  */
 export async function analyzeVideo(
 	baseUrl: string,
 	apiKey: string,
 	model: string,
 	videoUrl: string,
-): Promise<{ text: string } | { error: string }> {
+): Promise<{ text: string; keyMoments?: VideoKeyMoment[] } | { error: string }> {
 	try {
 		if (!videoUrl) {
 			return { error: "没有可分析的视频链接" };
@@ -604,8 +744,207 @@ export async function analyzeVideo(
 		if (res.status < 200 || res.status >= 300) {
 			return { error: `HTTP ${res.status}：${res.text.slice(0, 200)}` };
 		}
-		return parseChatCompletion(res.text);
+		const parsedChat = parseChatCompletion(res.text);
+		if ("error" in parsedChat) {
+			return parsedChat;
+		}
+		const { text, keyMoments } = parseVideoKeyMoments(parsedChat.text);
+		return keyMoments.length > 0 ? { text, keyMoments } : { text };
 	} catch (e) {
 		return { error: e instanceof Error ? e.message : String(e) };
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Key-frame extraction (ffmpeg)
+// ---------------------------------------------------------------------------
+
+/** Minimal adapter surface for key-frame writes (subset of DataAdapter). */
+export interface KeyFramesVaultAdapter {
+	writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+	exists(path: string): Promise<boolean>;
+}
+
+let ffmpegAvailableCache: boolean | null = null;
+
+/** Reset the cached ffmpeg probe (test hook). */
+export function resetFfmpegProbe(): void {
+	ffmpegAvailableCache = null;
+}
+
+/**
+ * One-shot ffmpeg availability probe (`where`/`which`), cached for the
+ * session. Never throws.
+ */
+export function isFfmpegAvailable(): boolean {
+	if (ffmpegAvailableCache !== null) {
+		return ffmpegAvailableCache;
+	}
+	try {
+		const req = (window as unknown as { require?: (m: string) => unknown })
+			.require;
+		const cp = req?.("child_process") as typeof import("child_process") | undefined;
+		if (!cp) {
+			ffmpegAvailableCache = false;
+			return false;
+		}
+		const cmd = process.platform === "win32" ? "where" : "which";
+		const r = cp.spawnSync(cmd, ["ffmpeg"], { windowsHide: true });
+		ffmpegAvailableCache = r.status === 0;
+	} catch {
+		ffmpegAvailableCache = false;
+	}
+	return ffmpegAvailableCache;
+}
+
+function nodeRequire(): {
+	fs: typeof import("fs");
+	os: typeof import("os");
+	cp: typeof import("child_process");
+} | null {
+	try {
+		const req = (window as unknown as { require?: (m: string) => unknown })
+			.require;
+		const fs = req?.("fs") as typeof import("fs") | undefined;
+		const os = req?.("os") as typeof import("os") | undefined;
+		const cp = req?.("child_process") as
+			| typeof import("child_process")
+			| undefined;
+		if (!fs || !os || !cp) {
+			return null;
+		}
+		return { fs, os, cp };
+	} catch {
+		return null;
+	}
+}
+
+/** Run one ffmpeg frame extraction (60s timeout). Never throws. */
+function ffmpegExtractFrame(
+	cp: typeof import("child_process"),
+	videoUrl: string,
+	atSeconds: number,
+	outPath: string,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const done = (ok: boolean): void => {
+			if (!settled) {
+				settled = true;
+				resolve(ok);
+			}
+		};
+		try {
+			// Argument-ARRAY spawn (no shell): URL / paths can never be
+			// interpreted as shell syntax.
+			const child = cp.spawn(
+				"ffmpeg",
+				[
+					"-ss",
+					String(atSeconds),
+					"-i",
+					videoUrl,
+					"-frames:v",
+					"1",
+					"-q:v",
+					"3",
+					"-y",
+					outPath,
+				],
+				{ windowsHide: true },
+			);
+			const timer = setTimeout(() => {
+				child.kill();
+				done(false);
+			}, 60_000);
+			child.on("error", () => {
+				clearTimeout(timer);
+				done(false);
+			});
+			child.on("close", (code) => {
+				clearTimeout(timer);
+				done(code === 0);
+			});
+		} catch {
+			done(false);
+		}
+	});
+}
+
+/**
+ * Extract the AI-suggested key frames of a video into the vault media folder:
+ * per moment t, `ffmpeg -ss {t} -i {videoUrl} -frames:v 1 -q:v 3 {tmp}` (the
+ * -ss BEFORE -i = stream seek, only the needed range is downloaded), the temp
+ * file is then written via the adapter to
+ * `{mediaFolder}/{noteId}/kf-{i}-{t}s.jpg` (vault-relative, 1-based i).
+ * Skips moments whose target file already exists (idempotent re-runs); a
+ * failed frame never aborts the rest. When ffmpeg is unavailable (or key
+ * moments are empty) nothing is extracted — the caller then writes no
+ * 关键帧 section. NEVER throws; per-frame failures are reported via `log`.
+ */
+export async function extractKeyFrames(
+	videoUrl: string,
+	noteId: string,
+	mediaFolder: string,
+	keyMoments: readonly VideoKeyMoment[],
+	adapter: KeyFramesVaultAdapter,
+	log?: (line: string) => void,
+): Promise<{ ffmpeg: boolean; frames: VideoKeyMoment[] }> {
+	if (!keyMoments || keyMoments.length === 0 || !videoUrl) {
+		return { ffmpeg: isFfmpegAvailable(), frames: [] };
+	}
+	if (!isFfmpegAvailable()) {
+		log?.("关键帧抽取：ffmpeg 不可用，跳过");
+		return { ffmpeg: false, frames: [] };
+	}
+	const mods = nodeRequire();
+	if (!mods) {
+		log?.("关键帧抽取：Node fs/os/child_process 模块不可用，跳过");
+		return { ffmpeg: true, frames: [] };
+	}
+	const { fs, os, cp } = mods;
+	const cleanFolder = (mediaFolder ?? "").replace(/^\/+|\/+$/g, "");
+	const frames: VideoKeyMoment[] = [];
+	const sep = process.platform === "win32" ? "\\" : "/";
+	const tmpDir = os.tmpdir();
+	for (let i = 0; i < keyMoments.length; i++) {
+		const km = keyMoments[i];
+		if (!km || !Number.isFinite(km.t)) {
+			continue;
+		}
+		const target = `${cleanFolder}/${noteId}/kf-${i + 1}-${km.t}s.jpg`;
+		try {
+			if (await adapter.exists(target)) {
+				frames.push(km);
+				log?.(`关键帧抽取：已存在，跳过 ${target}`);
+				continue;
+			}
+			const tmpOut = `${tmpDir}${sep}kf-${noteId}-${i + 1}-${km.t}s.jpg`;
+			const ok = await ffmpegExtractFrame(cp, videoUrl, km.t, tmpOut);
+			if (!ok) {
+				log?.(`关键帧抽取：ffmpeg 失败（t=${km.t}s），跳过该帧`);
+				continue;
+			}
+			const buf = fs.readFileSync(tmpOut);
+			await adapter.writeBinary(
+				target,
+				buf.buffer.slice(
+					buf.byteOffset,
+					buf.byteOffset + buf.byteLength,
+				) as ArrayBuffer,
+			);
+			try {
+				fs.unlinkSync(tmpOut);
+			} catch {
+				/* temp cleanup is best-effort */
+			}
+			frames.push(km);
+			log?.(`关键帧抽取：已写入 ${target}`);
+		} catch (e) {
+			log?.(
+				`关键帧抽取：单帧失败（t=${km.t}s，继续）：${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+	return { ffmpeg: true, frames };
 }

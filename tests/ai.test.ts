@@ -16,6 +16,11 @@ import {
 	frontmatterTypeIsVideo,
 	imageMimeFromPath,
 	IMAGE_ANALYSIS_PROMPT,
+	parseVideoKeyMoments,
+	renderKeyFramesSection,
+	applyKeyFrames,
+	extractKeyFrames,
+	resetFfmpegProbe,
 	parseChatCompletion,
 	applyImageAnalysis,
 	applyVideoTranscript,
@@ -335,5 +340,109 @@ describe("applyVideoTranscript", () => {
 		expect(updated).toContain("### 图片分析\n图片分析结果");
 		expect(updated).toContain("### 视频转写\n新转录");
 		expect(updated).not.toContain("旧转录");
+	});
+});
+
+describe("extractLocalImagePaths with vault-absolute embeds", () => {
+	it("strips the leading / and returns adapter-relative paths", () => {
+		const md = "![](/RedNote/Media/n1/1.webp)\n![](/RedNote/Media/n1/2.png)\n![](https://cdn/3.webp)";
+		expect(extractLocalImagePaths(md, "RedNote/Media")).toEqual([
+			"RedNote/Media/n1/1.webp",
+			"RedNote/Media/n1/2.png",
+		]);
+	});
+
+	it("still handles legacy relative embeds", () => {
+		expect(extractLocalImagePaths("![](RedNote/Media/n1/1.webp)", "RedNote/Media")).toEqual([
+			"RedNote/Media/n1/1.webp",
+		]);
+	});
+});
+
+describe("parseVideoKeyMoments", () => {
+	it("parses a trailing json block and strips it from the text", () => {
+		const src = "转录正文\n```json\n[{\"t\": 12, \"why\": \"高潮\"},{\"t\": \"33\", \"why\": \"结尾\"}]\n```";
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([
+			{ t: 12, why: "高潮" },
+			{ t: 33, why: "结尾" },
+		]);
+		expect(r.text).not.toContain("```json");
+		expect(r.text).toContain("转录正文");
+	});
+
+	it("ignores malformed blocks and keeps the text verbatim", () => {
+		const src = "正文\n```json\n[{t: 12}]\n```";
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([]);
+		expect(r.text).toBe(src);
+	});
+
+	it("returns no moments when the block is missing", () => {
+		const r = parseVideoKeyMoments("纯文字，无代码块");
+		expect(r.keyMoments).toEqual([]);
+		expect(r.text).toBe("纯文字，无代码块");
+	});
+});
+
+describe("renderKeyFramesSection / applyKeyFrames", () => {
+	const MOMENTS = [
+		{ t: 12, why: "高潮" },
+		{ t: 33, why: "结尾" },
+	];
+
+	it("renders one vault-absolute embed line per frame", () => {
+		const block = renderKeyFramesSection(MOMENTS, "n1", "RedNote/Media");
+		expect(block).toContain("### 关键帧");
+		expect(block).toContain("- ![关键帧12s](/RedNote/Media/n1/kf-1-12s.jpg)（高潮）");
+		expect(block).toContain("- ![关键帧33s](/RedNote/Media/n1/kf-2-33s.jpg)（结尾）");
+	});
+
+	it("returns empty for no moments", () => {
+		expect(renderKeyFramesSection([], "n1", "RedNote/Media")).toBe("");
+		expect(applyKeyFrames("body", [], "n1", "RedNote/Media")).toBe("body");
+	});
+
+	it("inserts the section after 视频转写 and replaces it on re-run", () => {
+		const base = "## 🤖 AI 摘要\n\n### 视频转写\n转录\n";
+		const once = applyKeyFrames(base, MOMENTS, "n1", "RedNote/Media");
+		expect(once.indexOf("### 视频转写")).toBeLessThan(once.indexOf("### 关键帧"));
+		const twice = applyKeyFrames(once, MOMENTS, "n1", "RedNote/Media");
+		expect(twice).toBe(once);
+		expect(twice.match(/### 关键帧/g)).toHaveLength(1);
+	});
+});
+
+describe("extractKeyFrames (ffmpeg unavailable)", () => {
+	it("skips extraction and never touches the adapter when ffmpeg is missing", async () => {
+		resetFfmpegProbe();
+		const writes: string[] = [];
+		const adapter = {
+			writeBinary: async (p: string) => {
+				writes.push(p);
+			},
+			exists: async () => false,
+		};
+		const r = await extractKeyFrames(
+			"https://cdn/v.mp4",
+			"n1",
+			"RedNote/Media",
+			[{ t: 12, why: "高潮" }],
+			adapter,
+		);
+		// In the node test environment window.require is unavailable -> probe
+		// must resolve to "unavailable" and no frame is written.
+		expect(r.ffmpeg).toBe(false);
+		expect(r.frames).toEqual([]);
+		expect(writes).toEqual([]);
+	});
+
+	it("skips immediately when there are no key moments", async () => {
+		resetFfmpegProbe();
+		const r = await extractKeyFrames("https://cdn/v.mp4", "n1", "RedNote/Media", [], {
+			writeBinary: async () => undefined,
+			exists: async () => false,
+		});
+		expect(r.frames).toEqual([]);
 	});
 });

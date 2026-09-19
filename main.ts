@@ -16,18 +16,21 @@ import {
 import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
-import { epochToIso } from "./src/rednote/markdown";
+import { epochToIso, fixMediaEmbedPaths } from "./src/rednote/markdown";
 import {
 	AI_SECTION_VIDEO,
 	analyzeImages,
 	analyzeVideo,
 	applyImageAnalysis,
+	applyKeyFrames,
 	applyVideoTranscript,
 	chunkArray,
+	extractKeyFrames,
 	extractLocalImagePaths,
 	extractVideoNoteUrl,
 	frontmatterHasImageAnalysis,
 	frontmatterHasSection,
+	frontmatterStringValue,
 	frontmatterTypeIsVideo,
 } from "./src/rednote/ai";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
@@ -195,6 +198,14 @@ export default class RedNoteSyncPlugin extends Plugin {
 			name: "Pull Rednote：AI 补处理收藏笔记",
 			callback: () => {
 				void this.runAiBackfill();
+			},
+		});
+
+		this.addCommand({
+			id: "fix-media-paths",
+			name: "Pull Rednote：修复媒体嵌入路径",
+			callback: () => {
+				void this.runFixMediaPaths();
 			},
 		});
 	}
@@ -532,14 +543,72 @@ export default class RedNoteSyncPlugin extends Plugin {
 			return "fail";
 		}
 		const adapter = this.app.vault.adapter;
+		let noteId = frontmatterStringValue(content, "note_id");
+		let newContent = applyVideoTranscript(content, s.aiModel, r.text);
+		// Key frames (ffmpeg): extract only when the model returned key moments;
+		// without ffmpeg or without moments no 关键帧 section is written.
+		if (r.keyMoments && r.keyMoments.length > 0) {
+			if (!noteId) {
+				// Fall back to the file stem when frontmatter lacks note_id.
+				noteId = filePath.slice(filePath.lastIndexOf("/") + 1).replace(/\.md$/i, "");
+			}
+			const kf = await extractKeyFrames(
+				videoUrl,
+				noteId,
+				s.mediaFolder,
+				r.keyMoments,
+				adapter,
+				(line) => this.session.log(line),
+			);
+			if (kf.frames.length > 0) {
+				newContent = applyKeyFrames(newContent, kf.frames, noteId, s.mediaFolder);
+			}
+		}
 		try {
-			await adapter.write(filePath, applyVideoTranscript(content, s.aiModel, r.text));
+			await adapter.write(filePath, newContent);
 		} catch (e) {
 			this.session.log(`AI 视频分析：写回失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
 			return "fail";
 		}
 		this.session.log(`AI 视频分析成功：${filePath}`);
 		return "ok";
+	}
+
+	/**
+	 * One-time repair command: rewrite legacy relative media embeds
+	 * `](RedNote/Media/...` in every note under notesFolder to the
+	 * vault-absolute `](/RedNote/Media/...` form (Obsidian resolves markdown
+	 * links relative to the note's folder, so collection subfolder notes could
+	 * not render their media). Content-hash-neutral for note IDs — the note
+	 * index is untouched. Never throws.
+	 */
+	async runFixMediaPaths(): Promise<void> {
+		const s = this.settings;
+		const folder = (s.notesFolder ?? "").replace(/^\/+|\/+$/g, "");
+		const prefix = folder ? `${folder}/` : "";
+		const paths = this.app.vault
+			.getMarkdownFiles()
+			.map((f) => f.path)
+			.filter((p) => !prefix || p.startsWith(prefix));
+		const adapter = this.app.vault.adapter;
+		let filesChanged = 0;
+		let totalReplaced = 0;
+		for (const p of paths) {
+			try {
+				const content = await adapter.read(p);
+				const { text, replaced } = fixMediaEmbedPaths(content, s.mediaFolder);
+				if (replaced > 0) {
+					await adapter.write(p, text);
+					filesChanged += 1;
+					totalReplaced += replaced;
+				}
+			} catch (e) {
+				this.session.log(
+					`修复媒体嵌入路径：读取/写入失败（跳过） ${p} ${e instanceof Error ? e.message : String(e)}`,
+				);
+			}
+		}
+		new Notice(`媒体嵌入路径修复完成：${filesChanged} 个文件，共替换 ${totalReplaced} 处`, 8000);
 	}
 
 	/**

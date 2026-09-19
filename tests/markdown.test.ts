@@ -5,6 +5,7 @@ import {
 	isoToDateOnly,
 	applyTagPrefix,
 	renderNoteMarkdown,
+	fixMediaEmbedPaths,
 	splitAiSection,
 	appendAiSection,
 	type NoteMediaMap,
@@ -162,7 +163,7 @@ describe("renderNoteMarkdown", () => {
 });
 
 describe("renderNoteMarkdown with M3 media map", () => {
-	it("embeds downloaded images as vault-relative paths", () => {
+	it("embeds downloaded images as vault-absolute paths (/ prefix)", () => {
 		const media: NoteMediaMap = {
 			imageLocal: ["RedNote/Media/65f2a8b3000000001234abcd/1.webp", null],
 			videoLocal: null,
@@ -173,7 +174,7 @@ describe("renderNoteMarkdown with M3 media map", () => {
 			media,
 		);
 		expect(md).toContain(
-			"![](RedNote/Media/65f2a8b3000000001234abcd/1.webp)",
+			"![](/RedNote/Media/65f2a8b3000000001234abcd/1.webp)",
 		);
 		// Slot without a local file keeps the remote URL.
 		expect(md).toContain("![](https://cdn/2.webp)");
@@ -194,7 +195,7 @@ describe("renderNoteMarkdown with M3 media map", () => {
 			{ imageLocal: [], videoLocal: "RedNote/Media/65f2a8b3000000001234abcd/video.mp4" },
 		);
 		expect(md).toContain(
-			"[▶ 视频](RedNote/Media/65f2a8b3000000001234abcd/video.mp4)",
+			"[▶ 视频](/RedNote/Media/65f2a8b3000000001234abcd/video.mp4)",
 		);
 		expect(md).not.toContain("[▶ 观看视频]");
 	});
@@ -285,5 +286,47 @@ describe("renderNoteMarkdown video link", () => {
 			"xhs/",
 		);
 		expect(md).toContain("[▶ 观看视频](https://sns-video-bd.xhscdn.com/abc)");
+	});
+});
+
+describe("body horizontal-rule sanitization", () => {
+	it("rewrites standalone --- body lines to *** (frontmatter fences intact)", () => {
+		const md = renderNoteMarkdown(sampleRecord({ body: "第一段\n---\n第二段" }), "xhs/");
+		// Exactly the two frontmatter fences remain as standalone --- lines.
+		expect(md.startsWith("---\n")).toBe(true);
+		expect(md.match(/^[ \t]*---[ \t]*$/gm)).toHaveLength(2);
+		expect(md).toContain("第一段\n***\n第二段");
+	});
+
+	it("leaves inline --- and non-line occurrences untouched", () => {
+		const md = renderNoteMarkdown(sampleRecord({ body: "a---b\n----x" }), "xhs/");
+		expect(md).toContain("a---b");
+		expect(md).toContain("----x");
+	});
+});
+
+describe("fixMediaEmbedPaths", () => {
+	it("rewrites relative media embeds to vault-absolute and counts them", () => {
+		const src = "看图\n![](RedNote/Media/n1/1.webp)\n[▶ 视频](RedNote/Media/n1/v.mp4)\n![](https://cdn/x.webp)";
+		const { text, replaced } = fixMediaEmbedPaths(src, "RedNote/Media");
+		expect(replaced).toBe(2);
+		expect(text).toContain("![](/RedNote/Media/n1/1.webp)");
+		expect(text).toContain("[▶ 视频](/RedNote/Media/n1/v.mp4)");
+		// Remote URL untouched.
+		expect(text).toContain("![](https://cdn/x.webp)");
+	});
+
+	it("does not double-slash already-absolute embeds and is then a no-op", () => {
+		const src = "![](/RedNote/Media/n1/1.webp)";
+		const once = fixMediaEmbedPaths(src, "RedNote/Media");
+		expect(once.replaced).toBe(0);
+		expect(once.text).toBe(src);
+	});
+
+	it("returns unchanged text for an empty mediaFolder", () => {
+		const src = "![](RedNote/Media/n1/1.webp)";
+		const r = fixMediaEmbedPaths(src, "");
+		expect(r.replaced).toBe(0);
+		expect(r.text).toBe(src);
 	});
 });

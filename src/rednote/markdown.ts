@@ -89,6 +89,28 @@ export interface NoteMediaMap {
 }
 
 /**
+ * Make a vault-relative local media path vault-ABSOLUTE ("/RedNote/...").
+ * Obsidian resolves markdown-link targets relative to the NOTE's folder, so a
+ * plain "RedNote/Media/..." embed breaks for notes inside collection
+ * subdirectories; the leading "/" anchors it to the vault root. Remote URLs
+ * are never passed here.
+ */
+export function toVaultAbsolutePath(path: string): string {
+	const p = path ?? "";
+	return p.startsWith("/") ? p : `/${p}`;
+}
+
+/**
+ * Escape the note body's standalone `---` lines as `***` (both are horizontal
+ * rules in Markdown, but a body-level `---` line would prematurely close the
+ * YAML frontmatter). Only whole-line `---` (optional surrounding whitespace)
+ * is rewritten; `---` inside a sentence is untouched. Pure.
+ */
+export function sanitizeBodyHr(body: string): string {
+	return (body ?? "").replace(/^[ \t]*---[ \t]*$/gm, "***");
+}
+
+/**
  * Render the full note Markdown for a record, per docs/note-template.md.
  *
  * Field ordering matches the template: note_id, type, title, author, author_id,
@@ -147,17 +169,19 @@ export function renderNoteMarkdown(
 
 	const bodyLines: string[] = [];
 	if (record.body) {
-		bodyLines.push(record.body);
+		bodyLines.push(sanitizeBodyHr(record.body));
 	}
 
 	if (record.type === "image") {
 		record.images.forEach((url, i) => {
 			const local = media?.imageLocal[i];
-			bodyLines.push(`![](${local || url})`);
+			// Local downloads embed vault-ABSOLUTE (leading "/") so the link
+			// resolves from any note folder; remote fallback stays untouched.
+			bodyLines.push(`![](${local ? toVaultAbsolutePath(local) : url})`);
 		});
 	} else if (record.type === "video") {
 		if (media?.videoLocal) {
-			bodyLines.push(`[▶ 视频](${media.videoLocal})`);
+			bodyLines.push(`[▶ 视频](${toVaultAbsolutePath(media.videoLocal)})`);
 		} else if (record.video_url) {
 			bodyLines.push(`[▶ 观看视频](${record.video_url})`);
 		}
@@ -207,4 +231,32 @@ export function appendAiSection(newContent: string, oldContent: string): string 
 	// renderNoteMarkdown ends with exactly one "\n"; add one blank line so the
 	// heading starts its own paragraph, then the block verbatim to EOF.
 	return `${newContent.replace(/\n*$/, "\n")}\n${ai}`;
+}
+
+/**
+ * One-time repair for notes synced before the vault-absolute embed fix: rewrite
+ * markdown link/embed targets `](RedNote/Media/...` (and `](/RedNote/Media/...`
+ * with an existing slash) to the anchored `](/RedNote/Media/...` form. Only
+ * vault-internal paths under `mediaFolder` match — remote http(s) URLs are
+ * untouched. Pure; returns the new text and the number of rewritten targets.
+ */
+export function fixMediaEmbedPaths(
+	content: string,
+	mediaFolder: string,
+): { text: string; replaced: number } {
+	const folder = (mediaFolder ?? "").replace(/^\/+|\/+$/g, "");
+	if (!folder) {
+		return { text: content ?? "", replaced: 0 };
+	}
+	const re = new RegExp(`\\]\\((\\/?)(${folder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\/)`, "g");
+	let replaced = 0;
+	const text = (content ?? "").replace(re, (_all, slash: string, rest: string) => {
+		if (slash === "/") {
+			// Already vault-absolute — leave as-is without counting.
+			return `](${slash}${rest}`;
+		}
+		replaced += 1;
+		return `](/${rest}`;
+	});
+	return { text, replaced };
 }
