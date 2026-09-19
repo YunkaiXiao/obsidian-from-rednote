@@ -9,7 +9,15 @@ import type { RedNoteRecord } from "./types";
  * Wraps in double quotes and escapes backslashes + double quotes.
  */
 export function yamlScalar(value: string): string {
-	return `"${(value ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+	// Newlines inside a double-quoted YAML scalar demand indented continuation
+	// lines — XHS titles can contain real line breaks, which broke frontmatter
+	// parsing on real notes ("deficient indentation" / 无效属性). Fold to spaces.
+	const folded = (value ?? "")
+		.replace(/\r\n?/g, "\n")
+		.replace(/\n+/g, " ")
+		.replace(/\\/g, "\\\\")
+		.replace(/"/g, '\\"');
+	return `"${folded}"`;
 }
 
 /**
