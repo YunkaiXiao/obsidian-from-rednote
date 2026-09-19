@@ -17,6 +17,13 @@ import { NotLoggedInError, SignError } from "./src/rednote/types";
 import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
+import {
+	analyzeImages,
+	applyImageAnalysis,
+	chunkArray,
+	extractLocalImagePaths,
+	frontmatterHasImageAnalysis,
+} from "./src/rednote/ai";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
 	evaluateRateLimit,
@@ -32,6 +39,15 @@ export interface RedNoteSyncSettings {
 	aiBaseUrl: string;
 	aiApiKey: string;
 	aiModel: string;
+	/**
+	 * M4.1 AI executor (ADR-009): "plugin" = in-plugin OpenAI-compatible
+	 * image analysis right after sync + backfill command; "zcode" = the
+	 * plugin calls NO AI at all (ai_sections stays without image_analysis,
+	 * a ZCode session batch-processes those notes per the M4.2 protocol).
+	 */
+	aiExecutor: "plugin" | "zcode";
+	/** M4.1: notes per batch for the AI backfill command (1-50). */
+	aiBatchSize: number;
 	tagPrefix: string;
 	notesFolder: string;
 	mediaFolder: string;
@@ -62,6 +78,8 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	aiBaseUrl: "",
 	aiApiKey: "",
 	aiModel: "",
+	aiExecutor: "plugin",
+	aiBatchSize: 10,
 	tagPrefix: "xhs/",
 	notesFolder: "RedNote/Bookmarks",
 	mediaFolder: "RedNote/Media",
@@ -82,6 +100,8 @@ export default class RedNoteSyncPlugin extends Plugin {
 	/** Shared webview session (used by the settings tab's logout button). */
 	readonly session = new RedNoteSession();
 	private syncing = false;
+	/** M4.1: re-entrancy guard for the AI backfill / post-sync AI stage. */
+	private aiRunning = false;
 	/** Guard against re-entrant login modals (one login webview at a time). */
 	private loginModalOpen = false;
 	/** Live settings tab reference so login-state changes can re-render it. */
@@ -161,6 +181,14 @@ export default class RedNoteSyncPlugin extends Plugin {
 			name: "Pull Rednote：打开登录窗口",
 			callback: () => {
 				this.openLogin();
+			},
+		});
+
+		this.addCommand({
+			id: "ai-backfill",
+			name: "Pull Rednote：AI 补处理收藏笔记",
+			callback: () => {
+				void this.runAiBackfill();
 			},
 		});
 	}
@@ -375,6 +403,10 @@ export default class RedNoteSyncPlugin extends Plugin {
 			await this.saveSettings();
 
 			new Notice(makeSummaryNotice(result), 8000);
+			// M4.1 post-sync AI stage: plugin-executor image analysis over the
+			// notes written THIS run. Fully failure-isolated — an AI error never
+			// affects the sync counts above or the incremental index.
+			await this.runPostSyncAi(result.newNoteIds);
 		} catch (e) {
 			if (e instanceof NotLoggedInError) {
 				// A signed request being rejected is NOT proof the login expired:
@@ -406,6 +438,177 @@ export default class RedNoteSyncPlugin extends Plugin {
 			}
 		} finally {
 			this.syncing = false;
+		}
+	}
+
+	/** M4.1 helper: sleep via window.setTimeout (matches runSync's style). */
+	private aiDelay(ms: number): Promise<void> {
+		return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+	}
+
+	/**
+	 * M4.1: analyze one note file's embedded local images and write the
+	 * result into the AI section + frontmatter markers. Never throws.
+	 * Returns "ok" (analyzed + written), "skip" (no local images; a marker
+	 * note is written so backfill scans stay idempotent), or "fail".
+	 */
+	private async aiProcessNoteFile(
+		filePath: string,
+	): Promise<"ok" | "skip" | "fail"> {
+		const s = this.settings;
+		const adapter = this.app.vault.adapter;
+		let content = "";
+		try {
+			content = await adapter.read(filePath);
+		} catch (e) {
+			this.session.log(`AI 图片分析：读取失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
+			return "fail";
+		}
+		const images = extractLocalImagePaths(content, s.mediaFolder);
+		if (images.length === 0) {
+			try {
+				await adapter.write(
+					filePath,
+					applyImageAnalysis(content, s.aiModel || "plugin", "（该笔记无本地图片，未做图片分析）"),
+				);
+				this.session.log(`AI 图片分析：无本地图片，已标记跳过 ${filePath}`);
+				return "skip";
+			} catch (e) {
+				this.session.log(`AI 图片分析：写入跳过标记失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
+				return "fail";
+			}
+		}
+		const r = await analyzeImages(s.aiBaseUrl, s.aiApiKey, s.aiModel, images, adapter);
+		if ("error" in r) {
+			this.session.log(`AI 图片分析失败（跳过，不影响同步）：${filePath} ${r.error}`);
+			return "fail";
+		}
+		try {
+			await adapter.write(filePath, applyImageAnalysis(content, s.aiModel, r.text));
+		} catch (e) {
+			this.session.log(`AI 图片分析：写回失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
+			return "fail";
+		}
+		this.session.log(`AI 图片分析成功：${filePath}`);
+		return "ok";
+	}
+
+	/**
+	 * M4.1: post-sync AI stage (plugin executor only). Runs AFTER the sync
+	 * summary Notice over this run's newNoteIds; every per-note failure is
+	 * logged + skipped and can never change the sync result counters or the
+	 * incremental index.
+	 */
+	private async runPostSyncAi(newNoteIds: string[]): Promise<void> {
+		const s = this.settings;
+		if (s.aiExecutor === "zcode") {
+			this.session.log("ZCode 模式：同步后不做 AI，等待 ZCode 批处理");
+			return;
+		}
+		if (!(s.aiEnabled && s.aiBaseUrl && s.aiApiKey)) {
+			if (newNoteIds.length > 0) {
+				new Notice(`AI 图片分析：跳过 ${newNoteIds.length} 篇（未启用或未配置接口）`, 6000);
+			}
+			return;
+		}
+		if (this.aiRunning) {
+			this.session.log("AI 补处理正在进行中，跳过本次同步后置 AI 阶段");
+			return;
+		}
+		this.aiRunning = true;
+		let ok = 0;
+		let fail = 0;
+		let skip = 0;
+		try {
+			for (let i = 0; i < newNoteIds.length; i++) {
+				const id = newNoteIds[i];
+				const file = id === undefined ? undefined : this.settings.noteIndex[id]?.file;
+				if (!file) {
+					skip += 1;
+					continue;
+				}
+				const r = await this.aiProcessNoteFile(file);
+				if (r === "ok") {
+					ok += 1;
+				} else if (r === "skip") {
+					skip += 1;
+				} else {
+					fail += 1;
+				}
+				// API politeness rate limit between notes.
+				if (i < newNoteIds.length - 1) {
+					await this.aiDelay(2_000);
+				}
+			}
+		} finally {
+			this.aiRunning = false;
+		}
+		new Notice(`AI 图片分析：成功 ${ok} 篇 / 失败 ${fail} 篇 / 跳过 ${skip} 篇`, 8000);
+	}
+
+	/**
+	 * M4.1: the AI backfill command — scan the notes folder for notes whose
+	 * frontmatter `ai_sections` lacks `image_analysis`, process them in
+	 * aiBatchSize-sized batches (progress Notice per batch, 5s between
+	 * batches). Idempotent: the ai_sections marker is written on success (and
+	 * on no-image notes), so re-running continues from the unprocessed rest.
+	 */
+	async runAiBackfill(): Promise<void> {
+		if (this.aiRunning) {
+			new Notice("AI 补处理正在进行中，请等待当前批次结束");
+			return;
+		}
+		const s = this.settings;
+		if (s.aiExecutor === "zcode") {
+			new Notice("当前 AI 执行器为 ZCode，插件不做补处理（等待 ZCode 批处理）");
+			return;
+		}
+		if (!(s.aiEnabled && s.aiBaseUrl && s.aiApiKey)) {
+			new Notice("请先在设置中启用 AI 并配置接口地址与 API Key", 6000);
+			return;
+		}
+		const folder = (s.notesFolder ?? "").replace(/^\/+|\/+$/g, "");
+		const prefix = folder ? `${folder}/` : "";
+		const paths = this.app.vault
+			.getMarkdownFiles()
+			.map((f) => f.path)
+			.filter((p) => !prefix || p.startsWith(prefix));
+		const pending: string[] = [];
+		for (const p of paths) {
+			try {
+				const c = await this.app.vault.adapter.read(p);
+				if (!frontmatterHasImageAnalysis(c)) {
+					pending.push(p);
+				}
+			} catch {
+				// Unreadable file: leave it for the next scan.
+			}
+		}
+		if (pending.length === 0) {
+			new Notice("没有待 AI 补处理的笔记");
+			return;
+		}
+		this.aiRunning = true;
+		const total = pending.length;
+		const batchSize = Math.min(50, Math.max(1, Math.floor(s.aiBatchSize) || 10));
+		const batches = chunkArray(pending, batchSize);
+		try {
+			for (let i = 0; i < batches.length; i++) {
+				const batch = batches[i];
+				if (!batch) {
+					continue;
+				}
+				for (const p of batch) {
+					await this.aiProcessNoteFile(p);
+				}
+				new Notice(`第 ${i + 1} 批完成，共 ${total} 篇待处理`, 5000);
+				if (i < batches.length - 1) {
+					await this.aiDelay(5_000);
+				}
+			}
+			new Notice(`AI 补处理完成：共 ${total} 篇`, 8000);
+		} finally {
+			this.aiRunning = false;
 		}
 	}
 }
@@ -562,6 +765,51 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 						settings.aiModel = value.trim();
 						await this.plugin.saveSettings();
 					});
+			});
+
+		new Setting(containerEl)
+			.setName("AI 执行器")
+			.setDesc(
+				"plugin：同步后在插件内即时调用 AI 接口做图片分析；zcode：同步后不调用任何 AI，仅留空标记，由 ZCode 批处理（协议见 M4.2）",
+			)
+			.addDropdown((dropdown) => {
+				dropdown
+					.addOption("plugin", "插件内（即时处理）")
+					.addOption("zcode", "ZCode（批处理）")
+					.setValue(settings.aiExecutor)
+					.onChange(async (value: string) => {
+						settings.aiExecutor = value === "zcode" ? "zcode" : "plugin";
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("AI 补处理批次大小")
+			.setDesc("「AI 补处理收藏笔记」命令每批处理的笔记数（1-50）")
+			.addText((text: TextComponent) => {
+				text.inputEl.type = "number";
+				text
+					.setPlaceholder("10")
+					.setValue(String(settings.aiBatchSize))
+					.onChange(async (value: string) => {
+						const parsed = Number(value);
+						settings.aiBatchSize =
+							Number.isFinite(parsed) && parsed >= 1
+								? Math.min(50, Math.max(1, Math.floor(parsed)))
+								: 10;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("AI 补处理")
+			.setDesc(
+				"扫描笔记目录中 ai_sections 缺少 image_analysis 的笔记，按批次调用 AI 图片分析（幂等：已处理的自动跳过）",
+			)
+			.addButton((b) => {
+				b.setButtonText("AI 补处理").onClick(() => {
+					void this.plugin.runAiBackfill();
+				});
 			});
 
 		new Setting(containerEl)
