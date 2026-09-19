@@ -261,3 +261,29 @@ note_id: "x"
 		expect(appendAiSection(NEW, OLD_WITHOUT_AI)).toBe(NEW);
 	});
 });
+
+describe("renderNoteMarkdown video link", () => {
+	it("renders the [▶ 观看视频] remote link when a video note has video_url", () => {
+		const md = renderNoteMarkdown(
+			{
+				note_id: "v1",
+				type: "video",
+				title: "视频笔记",
+				body: "正文",
+				author: "作者",
+				author_id: "u1",
+				author_link: "https://www.xiaohongshu.com/user/profile/u1",
+				link: "https://www.xiaohongshu.com/explore/v1",
+				tags: [],
+				images: [],
+				video_url: "https://sns-video-bd.xhscdn.com/abc",
+				created_at: "2026-09-01T10:30:00+08:00",
+				collected_at: "",
+				collection: "",
+				synced_at: "2026-09-20T00:00:00+08:00",
+			},
+			"xhs/",
+		);
+		expect(md).toContain("[▶ 观看视频](https://sns-video-bd.xhscdn.com/abc)");
+	});
+});

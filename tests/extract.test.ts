@@ -3,6 +3,7 @@ import {
 	authorLink,
 	noteLink,
 	mergeNoteCard,
+	pickVideoStreamUrl,
 	toRecord,
 	XHS_UTC_OFFSET_MIN,
 } from "../src/rednote/extract";
@@ -138,5 +139,87 @@ describe("toRecord", () => {
 	it("defaults collection to \"\" when the caller omits it (flat fallback)", () => {
 		const rec = toRecord({ note_id: "n2", type: "video" }, "2026-09-17T10:00:00+08:00");
 		expect(rec.collection).toBe("");
+	});
+});
+
+describe("pickVideoStreamUrl (2026 video.media.stream shape)", () => {
+	it("selects the highest-bitrate item of the first non-empty candidate codec (h264 before later keys)", () => {
+		const media = {
+			stream: {
+				unknown_codec: [{ master_url: "https://cdn/unknown-high" }],
+				h264: [
+					{ master_url: "https://cdn/low", avg_bitrate: 300000 },
+					{ backup_urls: ["https://cdn/high-bk"], avg_bitrate: 1200000 },
+					{ master_url: "https://cdn/mid", avg_bitrate: 700000 },
+				],
+				av1: [],
+			},
+		};
+		expect(pickVideoStreamUrl(media)).toBe("https://cdn/high-bk");
+	});
+
+	it("prefers av1 over h264 when both have streams", () => {
+		const media = {
+			stream: {
+				h264: [{ master_url: "https://cdn/h264" }],
+				av1: [{ masterUrl: "https://cdn/av1" }],
+			},
+		};
+		expect(pickVideoStreamUrl(media)).toBe("https://cdn/av1");
+	});
+
+	it("tolerates missing avg_bitrate (treated as 0) and missing url fields", () => {
+		const media = {
+			stream: {
+				h264: [
+					{ master_url: "https://cdn/nobitrate" },
+					{ avg_bitrate: 500 },
+					{ backup_urls: ["https://cdn/with-bitrate"], avg_bitrate: 1 },
+				],
+			},
+		};
+		expect(pickVideoStreamUrl(media)).toBe("https://cdn/with-bitrate");
+	});
+
+	it("falls back through backup_urls[0] -> master_url -> masterUrl", () => {
+		expect(pickVideoStreamUrl({ stream: { av1: [{ masterUrl: "https://cdn/c" }] } })).toBe("https://cdn/c");
+		expect(pickVideoStreamUrl({ stream: { av1: [{ master_url: "https://cdn/b" }] } })).toBe("https://cdn/b");
+		expect(pickVideoStreamUrl({ stream: { av1: [{ backup_urls: ["https://cdn/a"] }] } })).toBe("https://cdn/a");
+	});
+
+	it("returns \"\" for empty/malformed media shapes", () => {
+		expect(pickVideoStreamUrl(undefined)).toBe("");
+		expect(pickVideoStreamUrl({})).toBe("");
+		expect(pickVideoStreamUrl({ stream: {} })).toBe("");
+		expect(pickVideoStreamUrl({ stream: { av1: [] } })).toBe("");
+		expect(pickVideoStreamUrl({ stream: { av1: [null, "x"] } })).toBe("");
+	});
+
+	it("mergeNoteCard uses the stream URL when present", () => {
+		const merged = mergeNoteCard(card, {
+			type: "video",
+			video: {
+				media: { stream: { h264: [{ backup_urls: ["https://cdn/v"], avg_bitrate: 900000 }] } },
+			},
+		});
+		expect(merged.video_url).toBe("https://cdn/v");
+		expect(merged.type).toBe("video");
+	});
+
+	it("keeps the legacy consumer.origin_video_key path as fallback", () => {
+		const merged = mergeNoteCard(card, {
+			type: "video",
+			video: { consumer: { origin_video_key: "vidkey" } },
+		});
+		expect(merged.video_url).toBe("http://sns-video-bd.xhscdn.com/vidkey");
+	});
+
+	it("leaves video_url empty when both paths yield nothing", () => {
+		const merged = mergeNoteCard(card, {
+			type: "video",
+			video: { media: { stream: { av1: [] } } },
+		});
+		expect(merged.video_url).toBe("");
+		expect(merged.type).toBe("video");
 	});
 });

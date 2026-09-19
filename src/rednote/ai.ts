@@ -22,10 +22,19 @@ export const IMAGE_ANALYSIS_PROMPT =
 /** Frontmatter section marker written by this module. */
 export const AI_SECTION_IMAGE = "image_analysis";
 
+/** Frontmatter section marker for video transcription (M4 video track). */
+export const AI_SECTION_VIDEO = "video_transcript";
+
 /** The `## 🤖 AI 摘要` heading (kept in sync with markdown.ts's constant). */
 const AI_HEADING = "## 🤖 AI 摘要";
 /** The `### 图片分析` subsection heading. */
 const IMAGE_SUBHEADING = "### 图片分析";
+/** The `### 视频转写` subsection heading. */
+const VIDEO_SUBHEADING = "### 视频转写";
+
+/** Chinese prompt sent with every video transcription call (task contract wording). */
+export const VIDEO_ANALYSIS_PROMPT =
+	"转写并总结这个小红书视频：1) 完整中文转录稿（保留口语）；2) 三句话摘要。";
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -66,6 +75,33 @@ export function arrayBufferToBase64(buf: ArrayBuffer): string {
 		binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
 	}
 	return btoa(binary);
+}
+
+/**
+ * Build the OpenAI-compatible /chat/completions request body for a video
+ * call (qwen-style): a text prompt plus one `video_url` content item with the
+ * direct video URL. Pure.
+ *
+ * @param model    Model name; "" omits the field (server default).
+ * @param prompt   Text prompt.
+ * @param videoUrl Direct video URL (CDN-signed link).
+ */
+export function buildVideoRequestBody(
+	model: string,
+	prompt: string,
+	videoUrl: string,
+): Record<string, unknown> {
+	const content: Array<Record<string, unknown>> = [
+		{ type: "text", text: prompt },
+		{ type: "video_url", video_url: { url: videoUrl } },
+	];
+	const body: Record<string, unknown> = {
+		messages: [{ role: "user", content }],
+	};
+	if (model) {
+		body["model"] = model;
+	}
+	return body;
 }
 
 /**
@@ -158,11 +194,11 @@ export function extractLocalImagePaths(markdown: string, mediaPrefix: string): s
 
 /**
  * Lightweight frontmatter probe (NO yaml dependency per task contract):
- * does this note's `ai_sections` frontmatter already contain
- * `image_analysis`? Handles both block-list and inline-list forms and
+ * does this note's `ai_sections` frontmatter already contain the given
+ * section marker? Handles both block-list and inline-list forms and
  * tolerates quoted values. Pure.
  */
-export function frontmatterHasImageAnalysis(content: string): boolean {
+export function frontmatterHasSection(content: string, section: string): boolean {
 	if (!content) {
 		return false;
 	}
@@ -177,7 +213,7 @@ export function frontmatterHasImageAnalysis(content: string): boolean {
 			const inline = line.slice("ai_sections:".length).trim();
 			if (inline) {
 				// Inline form: ai_sections: [transcript, image_analysis]
-				return inline.includes(AI_SECTION_IMAGE);
+				return inline.includes(section);
 			}
 			inSections = true;
 			continue;
@@ -186,7 +222,7 @@ export function frontmatterHasImageAnalysis(content: string): boolean {
 			const item = line.match(/^\s+-\s*(.+)$/);
 			if (item) {
 				const val = item[1] ?? "";
-				if (val.trim().replace(/^["']|["']$/g, "") === AI_SECTION_IMAGE) {
+				if (val.trim().replace(/^["']|["']$/g, "") === section) {
 					return true;
 				}
 				continue;
@@ -195,6 +231,42 @@ export function frontmatterHasImageAnalysis(content: string): boolean {
 		}
 	}
 	return false;
+}
+
+/**
+ * `frontmatterHasSection(content, "image_analysis")` — kept for the existing
+ * callers. Pure.
+ */
+export function frontmatterHasImageAnalysis(content: string): boolean {
+	return frontmatterHasSection(content, AI_SECTION_IMAGE);
+}
+
+/**
+ * Does the note's frontmatter declare `type: video`? Tolerates quoting.
+ * Pure.
+ */
+export function frontmatterTypeIsVideo(content: string): boolean {
+	if (!content) {
+		return false;
+	}
+	const fm = matchFrontmatter(content);
+	if (!fm) {
+		return false;
+	}
+	return /^type:\s*["']?video["']?\s*$/m.test(fm.body);
+}
+
+/**
+ * Extract the direct video URL from a rendered note body: the
+ * `[▶ 观看视频](url)` / `[▶ 视频](url)` markdown link. Only remote http(s)
+ * URLs count — a local media path means the video was downloaded (M3) and
+ * cannot be fed to the AI as a link. Pure.
+ */
+export function extractVideoNoteUrl(markdown: string): string {
+	const re = /\[▶ (?:观看视频|视频)\]\(([^)\s]+)\)/;
+	const m = (markdown ?? "").match(re);
+	const url = m?.[1] ?? "";
+	return /^https?:\/\//.test(url) ? url : "";
 }
 
 /** A guarded frontmatter match (noUncheckedIndexedAccess-safe). */
@@ -240,12 +312,12 @@ function yamlScalar(value: string): string {
 }
 
 /**
- * Add `image_analysis` to the note's `ai_sections` frontmatter without
+ * Add a section marker to the note's `ai_sections` frontmatter without
  * disturbing other markers (block list gains a list item; inline list gains
  * an element; absent key gains a fresh block list). Pure. Caller guarantees
  * the marker is not already present.
  */
-function addImageAnalysisMarker(content: string): string {
+function addSectionMarker(content: string, section: string): string {
 	const fm = matchFrontmatter(content);
 	if (!fm) {
 		return content;
@@ -253,14 +325,14 @@ function addImageAnalysisMarker(content: string): string {
 	const body = fm.body;
 	const secRe = /^ai_sections:.*$/m;
 	if (!secRe.test(body)) {
-		return rebuildFrontmatter(fm, `${body}\nai_sections:\n  - ${AI_SECTION_IMAGE}`);
+		return rebuildFrontmatter(fm, `${body}\nai_sections:\n  - ${section}`);
 	}
 	const matched = body.match(secRe);
 	const existing = matched?.[0] ?? "";
 	const inline = existing.slice("ai_sections:".length).trim();
 	if (inline) {
 		const inner = inline.replace(/^\[/, "").replace(/\]$/, "").trim();
-		const replacement = `ai_sections: [${inner ? `${inner}, ` : ""}${AI_SECTION_IMAGE}]`;
+		const replacement = `ai_sections: [${inner ? `${inner}, ` : ""}${section}]`;
 		return rebuildFrontmatter(fm, body.replace(secRe, replacement));
 	}
 	// Block form: append the item right after the `ai_sections:` line,
@@ -271,7 +343,7 @@ function addImageAnalysisMarker(content: string): string {
 	while (end < lines.length && /^\s+-\s/.test(lines[end] ?? "")) {
 		end += 1;
 	}
-	lines.splice(end, 0, `  - ${AI_SECTION_IMAGE}`);
+	lines.splice(end, 0, `  - ${section}`);
 	return rebuildFrontmatter(fm, lines.join("\n"));
 }
 
@@ -290,18 +362,48 @@ export function applyImageAnalysis(
 	model: string,
 	text: string,
 ): string {
+	return applyAiSubsection(content, model, AI_SECTION_IMAGE, IMAGE_SUBHEADING, text);
+}
+
+/**
+ * M4 (video track): append (or replace) the `### 视频转写` subsection inside
+ * the note's `## 🤖 AI 摘要` section and update frontmatter `ai_model` /
+ * `ai_sections` (+`video_transcript` marker). Pure and idempotent; any
+ * existing `### 图片分析` block is preserved verbatim (and vice versa — the
+ * image applier preserves an existing `### 视频转写`).
+ */
+export function applyVideoTranscript(
+	content: string,
+	model: string,
+	text: string,
+): string {
+	return applyAiSubsection(content, model, AI_SECTION_VIDEO, VIDEO_SUBHEADING, text);
+}
+
+/**
+ * Shared implementation for both AI appliers: write the `model` frontmatter,
+ * add `section` to `ai_sections` when missing, then append (or replace) the
+ * `subheading` subsection inside the AI section. Pure.
+ */
+function applyAiSubsection(
+	content: string,
+	model: string,
+	section: string,
+	subheading: string,
+	text: string,
+): string {
 	let out = content ?? "";
 	if (!out.startsWith("---")) {
 		// No frontmatter (unexpected): still append the section at EOF.
 		out = `${out.replace(/\n*$/, "\n")}\n`;
 	} else {
 		out = setFrontmatterLine(out, "ai_model", `ai_model: ${yamlScalar(model)}`);
-		if (!frontmatterHasImageAnalysis(out)) {
-			out = addImageAnalysisMarker(out);
+		if (!frontmatterHasSection(out, section)) {
+			out = addSectionMarker(out, section);
 		}
 	}
 
-	const block = `${IMAGE_SUBHEADING}\n${text.replace(/\n*$/, "\n")}`;
+	const block = `${subheading}\n${text.replace(/\n*$/, "\n")}`;
 	const headingIdx = out.indexOf(`\n${AI_HEADING}`);
 	const startsWithHeading = out.startsWith(AI_HEADING);
 	if (headingIdx < 0 && !startsWithHeading) {
@@ -310,9 +412,9 @@ export function applyImageAnalysis(
 	const at = startsWithHeading && headingIdx < 0 ? 0 : headingIdx + 1;
 	const head = out.slice(0, at);
 	const aiBody = out.slice(at);
-	// Replace an existing 图片分析 subsection (up to the next `### ` or EOF),
-	// otherwise append at the end of the AI section.
-	const subIdx = aiBody.indexOf(`\n${IMAGE_SUBHEADING}`);
+	// Replace an existing subsection with this heading (up to the next
+	// `### ` or EOF), otherwise append at the end of the AI section.
+	const subIdx = aiBody.indexOf(`\n${subheading}`);
 	if (subIdx >= 0) {
 		let next = aiBody.length;
 		const following = aiBody.slice(subIdx + 1).indexOf("\n### ");
@@ -453,6 +555,46 @@ export async function analyzeImages(
 			// Explicit Content-Length: without it Node switches to chunked
 			// transfer-encoding, which many simple model servers cannot parse
 			// (observed: HTTP 400 "invalid JSON char 0" + ECONNRESET).
+			"Content-Length": String(Buffer.byteLength(body, "utf8")),
+		};
+		if (apiKey) {
+			headers["Authorization"] = `Bearer ${apiKey}`;
+		}
+		const res = await httpsPostJson(url, headers, body);
+		if (res.status < 200 || res.status >= 300) {
+			return { error: `HTTP ${res.status}：${res.text.slice(0, 200)}` };
+		}
+		return parseChatCompletion(res.text);
+	} catch (e) {
+		return { error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+/**
+ * Transcribe + summarize one video note via an OpenAI-compatible endpoint
+ * using the qwen-style `video_url` content item with the direct CDN link.
+ * Shares analyzeImages' transport/timeout/error/parse handling: never throws,
+ * failures come back as `{ error }`. No adapter needed — the video is not
+ * downloaded, the URL is passed straight through.
+ */
+export async function analyzeVideo(
+	baseUrl: string,
+	apiKey: string,
+	model: string,
+	videoUrl: string,
+): Promise<{ text: string } | { error: string }> {
+	try {
+		if (!videoUrl) {
+			return { error: "没有可分析的视频链接" };
+		}
+		const body = JSON.stringify(
+			buildVideoRequestBody(model, VIDEO_ANALYSIS_PROMPT, videoUrl),
+		);
+		const url = `${(baseUrl ?? "").replace(/\/+$/, "")}/chat/completions`;
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			// Explicit Content-Length (see analyzeImages: chunked encoding breaks
+			// simple model servers).
 			"Content-Length": String(Buffer.byteLength(body, "utf8")),
 		};
 		if (apiKey) {

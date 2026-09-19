@@ -18,11 +18,17 @@ import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso } from "./src/rednote/markdown";
 import {
+	AI_SECTION_VIDEO,
 	analyzeImages,
+	analyzeVideo,
 	applyImageAnalysis,
+	applyVideoTranscript,
 	chunkArray,
 	extractLocalImagePaths,
+	extractVideoNoteUrl,
 	frontmatterHasImageAnalysis,
+	frontmatterHasSection,
+	frontmatterTypeIsVideo,
 } from "./src/rednote/ai";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
@@ -464,6 +470,11 @@ export default class RedNoteSyncPlugin extends Plugin {
 			this.session.log(`AI 图片分析：读取失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
 			return "fail";
 		}
+		// Video notes go down the video-transcription track (they normally
+		// carry no local images, so the two tracks never interfere).
+		if (frontmatterTypeIsVideo(content)) {
+			return this.aiProcessVideoNoteFile(filePath, content);
+		}
 		const images = extractLocalImagePaths(content, s.mediaFolder);
 		if (images.length === 0) {
 			try {
@@ -490,6 +501,44 @@ export default class RedNoteSyncPlugin extends Plugin {
 			return "fail";
 		}
 		this.session.log(`AI 图片分析成功：${filePath}`);
+		return "ok";
+	}
+
+	/**
+	 * M4 (video track): transcribe one video note via its rendered
+	 * `[▶ 观看视频](url)` link. Idempotent on the `video_transcript`
+	 * frontmatter marker; preserves any existing `### 图片分析` subsection.
+	 * Never throws.
+	 */
+	private async aiProcessVideoNoteFile(
+		filePath: string,
+		content: string,
+	): Promise<"ok" | "skip" | "fail"> {
+		const s = this.settings;
+		if (frontmatterHasSection(content, AI_SECTION_VIDEO)) {
+			return "skip";
+		}
+		const videoUrl = extractVideoNoteUrl(content);
+		if (!videoUrl) {
+			// Old notes synced before the 2026 video extraction fix have no
+			// playable link (CDN URLs also expire) — skip WITHOUT re-calling
+			// the detail API (deep backfill is the M4.2 ZCode track).
+			this.session.log(`AI 视频分析：视频链接缺失（旧笔记），跳过 ${filePath}`);
+			return "skip";
+		}
+		const r = await analyzeVideo(s.aiBaseUrl, s.aiApiKey, s.aiModel, videoUrl);
+		if ("error" in r) {
+			this.session.log(`AI 视频分析失败（跳过，不影响同步）：${filePath} ${r.error}`);
+			return "fail";
+		}
+		const adapter = this.app.vault.adapter;
+		try {
+			await adapter.write(filePath, applyVideoTranscript(content, s.aiModel, r.text));
+		} catch (e) {
+			this.session.log(`AI 视频分析：写回失败 ${filePath} ${e instanceof Error ? e.message : String(e)}`);
+			return "fail";
+		}
+		this.session.log(`AI 视频分析成功：${filePath}`);
 		return "ok";
 	}
 
@@ -577,9 +626,13 @@ export default class RedNoteSyncPlugin extends Plugin {
 		for (const p of paths) {
 			try {
 				const c = await this.app.vault.adapter.read(p);
-				if (!frontmatterHasImageAnalysis(c)) {
-					pending.push(p);
-				}
+					const isVideo = frontmatterTypeIsVideo(c);
+					if (
+						!frontmatterHasImageAnalysis(c) ||
+						(isVideo && !frontmatterHasSection(c, AI_SECTION_VIDEO))
+					) {
+						pending.push(p);
+					}
 			} catch {
 				// Unreadable file: leave it for the next scan.
 			}

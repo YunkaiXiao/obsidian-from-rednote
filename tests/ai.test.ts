@@ -7,14 +7,18 @@ import { describe, expect, it } from "vitest";
 
 import {
 	arrayBufferToBase64,
+	buildVideoRequestBody,
 	buildVisionRequestBody,
 	chunkArray,
 	extractLocalImagePaths,
+	extractVideoNoteUrl,
 	frontmatterHasImageAnalysis,
+	frontmatterTypeIsVideo,
 	imageMimeFromPath,
 	IMAGE_ANALYSIS_PROMPT,
 	parseChatCompletion,
 	applyImageAnalysis,
+	applyVideoTranscript,
 } from "../src/rednote/ai";
 
 describe("imageMimeFromPath", () => {
@@ -262,5 +266,74 @@ describe("chunkArray", () => {
 
 	it("clamps invalid sizes to a single batch", () => {
 		expect(chunkArray([1, 2, 3], 0)).toEqual([[1, 2, 3]]);
+	});
+});
+
+describe("buildVideoRequestBody", () => {
+	it("builds a text + video_url content array (qwen style) and includes the model", () => {
+		const body = buildVideoRequestBody("qwen-vl-max", "提示词", "https://cdn/v.mp4");
+		const messages = body["messages"] as Array<{ role: string; content: Array<Record<string, unknown>> }>;
+		expect(messages).toHaveLength(1);
+		expect(messages[0]?.role).toBe("user");
+		expect(messages[0]?.content).toEqual([
+			{ type: "text", text: "提示词" },
+			{ type: "video_url", video_url: { url: "https://cdn/v.mp4" } },
+		]);
+		expect(body["model"]).toBe("qwen-vl-max");
+	});
+
+	it("omits the model field when empty", () => {
+		const body = buildVideoRequestBody("", "p", "https://cdn/v.mp4");
+		expect("model" in body).toBe(false);
+	});
+});
+
+describe("frontmatterTypeIsVideo / extractVideoNoteUrl", () => {
+	it("detects type: video in frontmatter (including quoted form)", () => {
+		expect(frontmatterTypeIsVideo("---\ntype: video\n---\n# t")).toBe(true);
+		expect(frontmatterTypeIsVideo('---\ntype: "video"\n---\n# t')).toBe(true);
+		expect(frontmatterTypeIsVideo("---\ntype: image\n---\n# t")).toBe(false);
+		expect(frontmatterTypeIsVideo("no frontmatter")).toBe(false);
+	});
+
+	it("extracts the remote video URL from both link spellings", () => {
+		expect(extractVideoNoteUrl("正文\n\n[▶ 观看视频](https://cdn/a.mp4)")).toBe("https://cdn/a.mp4");
+		expect(extractVideoNoteUrl("[▶ 视频](https://cdn/b.mp4)")).toBe("https://cdn/b.mp4");
+	});
+
+	it("ignores local media links and missing links", () => {
+		expect(extractVideoNoteUrl("[▶ 视频](RedNote/Media/n1/v.mp4)")).toBe("");
+		expect(extractVideoNoteUrl("无链接正文")).toBe("");
+	});
+});
+
+describe("applyVideoTranscript", () => {
+	const BASE = "---\nnote_id: \"v1\"\ntype: video\n---\n\n# 标题\n\n正文\n[▶ 观看视频](https://cdn/v.mp4)\n";
+
+	it("appends a 视频转写 subsection and the video_transcript marker", () => {
+		const out = applyVideoTranscript(BASE, "qwen", "转录内容");
+		expect(out).toContain("## 🤖 AI 摘要");
+		expect(out).toContain("### 视频转写\n转录内容\n");
+		expect(out).toContain("ai_sections:\n  - video_transcript");
+		expect(out).toContain("ai_model: \"qwen\"");
+		// Original note body above the AI heading is untouched.
+		expect(out.indexOf("# 标题")).toBeLessThan(out.indexOf("## 🤖 AI 摘要"));
+	});
+
+	it("is idempotent and preserves an existing 图片分析 block", () => {
+		const withImage = applyImageAnalysis(BASE, "m", "图片分析结果");
+		const once = applyVideoTranscript(withImage, "m", "转录内容");
+		const twice = applyVideoTranscript(once, "m", "转录内容");
+		expect(twice).toBe(once);
+		expect(once).toContain("### 图片分析\n图片分析结果");
+		expect(once).toContain("### 视频转写\n转录内容");
+	});
+
+	it("replaces an existing 视频转写 block in place (image block preserved)", () => {
+		const once = applyVideoTranscript(applyImageAnalysis(BASE, "m", "图片分析结果"), "m", "旧转录");
+		const updated = applyVideoTranscript(once, "m", "新转录");
+		expect(updated).toContain("### 图片分析\n图片分析结果");
+		expect(updated).toContain("### 视频转写\n新转录");
+		expect(updated).not.toContain("旧转录");
 	});
 });

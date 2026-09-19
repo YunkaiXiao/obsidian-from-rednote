@@ -21,6 +21,69 @@ export function noteLink(noteId: string): string {
 }
 
 /**
+ * Pick the best playable URL from the 2026 detail API's `video.media` shape:
+ * `media.stream` is an object keyed by codec name ("av1", "h264", ... unknown
+ * keys); each value is an array of stream items carrying `master_url` /
+ * `masterUrl` / `backup_urls` / `avg_bitrate`. Strategy (mirrors the
+ * deobfuscated commercial plugin): candidate codecs [av1, h264, then the
+ * remaining keys in order] — take the first codec with a non-empty stream
+ * array, sort that array by `avg_bitrate` (missing = 0) descending, take the
+ * top item, URL = `backup_urls[0] ?? master_url ?? masterUrl`. Every access
+ * is tolerant; "" when nothing usable is found. Pure.
+ */
+export function pickVideoStreamUrl(media: unknown): string {
+	if (!media || typeof media !== "object") {
+		return "";
+	}
+	const stream = (media as Record<string, unknown>)["stream"];
+	if (!stream || typeof stream !== "object") {
+		return "";
+	}
+	const keys = Object.keys(stream as Record<string, unknown>);
+	const ordered = ["av1", "h264", ...keys.filter((k) => k !== "av1" && k !== "h264")];
+	for (const codec of ordered) {
+		const arr = (stream as Record<string, unknown>)[codec];
+		if (!Array.isArray(arr) || arr.length === 0) {
+			continue;
+		}
+		const items = arr
+			.filter(
+				(it): it is Record<string, unknown> =>
+					!!it && typeof it === "object",
+			)
+			.map((it) => {
+				let url = "";
+				const backups = it["backup_urls"];
+				if (
+					Array.isArray(backups) &&
+					typeof backups[0] === "string" &&
+					backups[0].length > 0
+				) {
+					url = backups[0];
+				}
+				if (!url && typeof it["master_url"] === "string" && it["master_url"]) {
+					url = it["master_url"] as string;
+				}
+				if (!url && typeof it["masterUrl"] === "string" && it["masterUrl"]) {
+					url = it["masterUrl"] as string;
+				}
+				const bitrate = it["avg_bitrate"];
+				return {
+					url,
+					bitrate: typeof bitrate === "number" && Number.isFinite(bitrate) ? bitrate : 0,
+				};
+			})
+			.filter((it) => it.url.length > 0);
+		if (items.length === 0) {
+			continue;
+		}
+		items.sort((a, b) => b.bitrate - a.bitrate);
+		return items[0] !== undefined ? items[0].url : "";
+	}
+	return "";
+}
+
+/**
  * Merge a lightweight list card with the full detail payload into one
  * RedNoteRaw. The detail is authoritative for title/desc/user/images/video/
  * time; the card supplies xsec_* and (as a fallback) the note type.
@@ -92,15 +155,22 @@ export function mergeNoteCard(
 
 	const timeMs = pickNum("time") ?? pickNum("last_update_time") ?? card.time_ms;
 
-	// video url: detail `video.consumer` (h264 master or origin key).
+	// video url: 2026 API primary path is `video.media.stream` (codec-keyed
+	// stream arrays); the legacy `video.consumer.origin_video_key` is kept as
+	// a fallback for older payloads.
 	let videoUrl = card.video_url ?? "";
 	const video = d.video as Record<string, unknown> | undefined;
 	if (video && typeof video === "object") {
-		const consumer = video.consumer as Record<string, unknown> | undefined;
-		if (consumer) {
-			const master = consumer.origin_video_key as string | undefined;
-			if (typeof master === "string" && master.length > 0) {
-				videoUrl = `http://sns-video-bd.xhscdn.com/${master}`;
+		const fromStream = pickVideoStreamUrl(video.media);
+		if (fromStream) {
+			videoUrl = fromStream;
+		} else {
+			const consumer = video.consumer as Record<string, unknown> | undefined;
+			if (consumer) {
+				const master = consumer.origin_video_key as string | undefined;
+				if (typeof master === "string" && master.length > 0) {
+					videoUrl = `http://sns-video-bd.xhscdn.com/${master}`;
+				}
 			}
 		}
 	}
