@@ -9,6 +9,8 @@ jobs:
   build:
     if: "!contains(github.ref, 'alpha')"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Check out repository
