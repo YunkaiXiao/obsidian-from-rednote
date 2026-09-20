@@ -310,6 +310,36 @@ describe("buildVideoRequestBody", () => {
 		expect(content).toHaveLength(2);
 		expect(content.some((c) => c["type"] === "audio_url")).toBe(false);
 	});
+
+	it("uses a data:video/mp4 data URI when videoBase64 is given", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", undefined, "QUJD");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		const videoItem = content.find((c) => c["type"] === "video_url") as
+			| { video_url: { url: string } }
+			| undefined;
+		expect(videoItem?.video_url.url).toBe("data:video/mp4;base64,QUJD");
+		expect(videoItem?.video_url.url).not.toContain("https://cdn");
+	});
+
+	it("does not append audio_url when videoBase64 takes priority", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "REVG", "QUJD");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		expect(content).toHaveLength(2);
+		expect(content.some((c) => c["type"] === "audio_url")).toBe(false);
+	});
+
+	it("keeps the remote video_url + audio_url combination without videoBase64 (fallback path)", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "REVG");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		expect(content).toEqual([
+			{ type: "text", text: "p" },
+			{ type: "video_url", video_url: { url: "https://cdn/v.mp4" } },
+			{ type: "audio_url", audio_url: { url: "data:audio/mp3;base64,REVG" } },
+		]);
+	});
 });
 
 describe("frontmatterTypeIsVideo / extractVideoNoteUrl", () => {

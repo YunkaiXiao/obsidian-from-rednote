@@ -37,11 +37,10 @@ const VIDEO_SUBHEADING = "### 视频转写";
 
 /** Chinese prompt sent with every video transcription call (task contract wording). */
 export const VIDEO_ANALYSIS_PROMPT =
-	"你会同时收到视频画面帧与完整音频轨，请以音频语音为准输出完整转录稿（保留口语），" +
-	"画面字幕作为补充。转写并总结这个小红书视频：\n" +
-	"1) 完整中文转录稿（保留口语）；2) 三句话摘要；\n" +
-	"3. 【关键时刻】列出 3-5 个最值得截图的关键时间点，JSON 数组格式 " +
-	'[{"t": 秒数, "why": "一句话"}]，放在输出末尾的 ```json 代码块中';
+	"你会收到完整视频（含画面与音频）。请输出：\n" +
+	"1) 完整中文/原文语音转录稿（口语原样）；2) 三句话摘要；\n" +
+	"3. 【关键时刻】3-5 个值得截图的时间点，JSON 数组格式 " +
+	'[{"t": 秒, "why": "理由"}]，放在输出末尾的 ```json 代码块中';
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -93,20 +92,30 @@ export function arrayBufferToBase64(buf: ArrayBuffer): string {
  * @param prompt   Text prompt.
  * @param videoUrl    Direct video URL (CDN-signed link).
  * @param audioBase64 Optional base64 of the video's audio track (mp3). When
- *                    present, a qwen-style `audio_url` item (data URI) is
- *                    appended after the video_url item.
+ *                    present (and only when videoBase64 is absent), a
+ *                    qwen-style `audio_url` item (data URI) is appended after
+ *                    the video_url item.
+ * @param videoBase64 Optional base64 of the FULL video (mp4). When present,
+ *                    the video_url item's url becomes a
+ *                    `data:video/mp4;base64,...` data URI (full-video direct
+ *                    upload; the model natively handles A/V in one request)
+ *                    and audioBase64 is NOT appended.
  */
 export function buildVideoRequestBody(
 	model: string,
 	prompt: string,
 	videoUrl: string,
 	audioBase64?: string,
+	videoBase64?: string,
 ): Record<string, unknown> {
+	const videoUrlValue = videoBase64
+		? `data:video/mp4;base64,${videoBase64}`
+		: videoUrl;
 	const content: Array<Record<string, unknown>> = [
 		{ type: "text", text: prompt },
-		{ type: "video_url", video_url: { url: videoUrl } },
+		{ type: "video_url", video_url: { url: videoUrlValue } },
 	];
-	if (audioBase64) {
+	if (audioBase64 && !videoBase64) {
 		content.push({
 			type: "audio_url",
 			audio_url: { url: `data:audio/mp3;base64,${audioBase64}` },
@@ -658,6 +667,134 @@ export interface AiVaultAdapter {
 	exists(path: string): Promise<boolean>;
 }
 
+/** Max full-video payload handed to the model API: 40MB of mp4 bytes. */
+const VIDEO_MAX_BYTES = 40 * 1024 * 1024;
+
+/**
+ * Download the FULL video as base64 (mp4) via a plain Node http(s) GET:
+ * no ffmpeg involved — the complete file is pulled into an in-memory buffer
+ * and base64-encoded for a single-request full-video data-URI upload
+ * (user-verified: the LAN model service natively handles A/V this way).
+ * Protocol-aware like httpsPostJson (http:// LAN bases MUST use the http
+ * module). 120s timeout, 40MB size cap, fresh agent per request. Returns
+ * null on any failure (transport, timeout, over-size) and reports the reason
+ * via `log` — callers then fall back to the audio-track/remote-URL path.
+ * NEVER throws.
+ */
+export async function fetchVideoBase64(
+	videoUrl: string,
+	log?: (line: string) => void,
+): Promise<string | null> {
+	if (!videoUrl) {
+		return null;
+	}
+	return new Promise((resolve) => {
+		let settled = false;
+		const done = (b: string | null): void => {
+			if (!settled) {
+				settled = true;
+				resolve(b);
+			}
+		};
+		try {
+			const reqquire = (window as unknown as { require?: (m: string) => unknown })
+				.require;
+			const u = new URL(videoUrl);
+			const isTls = u.protocol === "https:";
+			const mod = reqquire?.(isTls ? "https" : "http") as
+				| typeof import("https")
+				| typeof import("http")
+				| undefined;
+			if (!mod) {
+				log?.("完整视频下载：Node http(s) 模块不可用，降级抽帧/音轨模式");
+				done(null);
+				return;
+			}
+			const req = mod.request(
+				{
+					hostname: u.hostname,
+					port: u.port || (isTls ? 443 : 80),
+					path: u.pathname + u.search,
+					method: "GET",
+					timeout: 120_000,
+					agent: false,
+				},
+				(res) => {
+					// Follow one redirect level (CDN links commonly 30x).
+					const status = res.statusCode ?? 0;
+					if (status >= 300 && status < 400) {
+						const loc = res.headers.location;
+						res.resume();
+						if (typeof loc === "string" && loc) {
+							try {
+								const redirectUrl = new URL(loc, videoUrl).toString();
+								fetchVideoBase64(redirectUrl, log).then(done);
+								return;
+							} catch {
+								/* fall through to error below */
+							}
+						}
+						log?.(`完整视频下载：HTTP ${status} 重定向无效，降级抽帧/音轨模式`);
+						done(null);
+						return;
+					}
+					if (status < 200 || status >= 300) {
+						res.resume();
+						log?.(`完整视频下载：HTTP ${status}，降级抽帧/音轨模式`);
+						done(null);
+						return;
+					}
+					const chunks: Buffer[] = [];
+					let total = 0;
+					res.on("data", (c: Buffer) => {
+						total += c.length;
+						if (total > VIDEO_MAX_BYTES) {
+							req.destroy();
+							log?.(
+								`视频超过 40MB 上限，降级抽帧模式`,
+							);
+							done(null);
+							return;
+						}
+						chunks.push(c);
+					});
+					res.on("end", () => {
+						if (total > VIDEO_MAX_BYTES) {
+							done(null);
+							return;
+						}
+						if (total === 0) {
+							log?.("完整视频下载：响应为空，降级抽帧/音轨模式");
+							done(null);
+							return;
+						}
+						done(Buffer.concat(chunks).toString("base64"));
+					});
+					res.on("error", () => {
+						log?.("完整视频下载：响应读取失败，降级抽帧/音轨模式");
+						done(null);
+					});
+				},
+			);
+			req.on("error", () => {
+				log?.("完整视频下载：请求失败，降级抽帧/音轨模式");
+				done(null);
+			});
+			req.on("timeout", () => {
+				req.destroy();
+				log?.("完整视频下载：请求超时（120s），降级抽帧/音轨模式");
+				done(null);
+			});
+			req.end();
+		} catch (e) {
+			log?.(
+				`完整视频下载失败（降级抽帧/音轨模式）：${e instanceof Error ? e.message : String(e)}`,
+			);
+			done(null);
+		}
+	});
+}
+
 /**
  * Analyze one note's local images via an OpenAI-compatible vision endpoint.
  * NEVER throws and NEVER returns a rejected promise: any failure (missing
@@ -735,13 +872,20 @@ export async function analyzeVideo(
 	model: string,
 	videoUrl: string,
 	audioBase64?: string,
+	videoBase64?: string,
 ): Promise<{ text: string; keyMoments?: VideoKeyMoment[] } | { error: string }> {
 	try {
-		if (!videoUrl) {
+		if (!videoUrl && !videoBase64) {
 			return { error: "没有可分析的视频链接" };
 		}
 		const body = JSON.stringify(
-			buildVideoRequestBody(model, VIDEO_ANALYSIS_PROMPT, videoUrl, audioBase64),
+			buildVideoRequestBody(
+				model,
+				VIDEO_ANALYSIS_PROMPT,
+				videoUrl,
+				audioBase64,
+				videoBase64,
+			),
 		);
 		const url = `${(baseUrl ?? "").replace(/\/+$/, "")}/chat/completions`;
 		const headers: Record<string, string> = {

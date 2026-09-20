@@ -29,6 +29,7 @@ import {
 	extractKeyFrames,
 	extractLocalImagePaths,
 	extractVideoNoteUrl,
+	fetchVideoBase64,
 	frontmatterHasImageAnalysis,
 	frontmatterHasSection,
 	frontmatterStringValue,
@@ -538,18 +539,32 @@ export default class RedNoteSyncPlugin extends Plugin {
 			this.session.log(`AI 视频分析：视频链接缺失（旧笔记），跳过 ${filePath}`);
 			return "skip";
 		}
-		// Audio track (same video URL, ffmpeg -> base64 mp3): passed alongside
-		// the video_url item when extraction succeeds; on failure / over-size
-		// the call proceeds video-only (previous behavior), never blocking.
-		const audioBase64 = await extractAudioBase64(videoUrl, (line) =>
-			this.session.log(line),
-		);
+		// Full-video base64 (no ffmpeg): download the complete mp4 and pass it
+		// as a data:video/mp4 data URI so the model natively handles audio+video
+		// in one request (user-verified on the LAN service). On failure /
+		// over-size, fall back to the previous chain: remote video_url + ffmpeg
+		// audio track; when that also fails, remote video_url only. Every path
+		// logs which mode was used; never blocks the sync.
+		const log = (line: string): void => this.session.log(line);
+		const videoBase64 = await fetchVideoBase64(videoUrl, log);
+		let audioBase64: string | null = null;
+		if (videoBase64) {
+			this.session.log(`AI 视频分析模式：完整视频 base64 直传（原生音视频）${filePath}`);
+		} else {
+			audioBase64 = await extractAudioBase64(videoUrl, log);
+			this.session.log(
+				audioBase64
+					? `AI 视频分析模式：远程 video_url + ffmpeg 音轨 ${filePath}`
+					: `AI 视频分析模式：仅远程 video_url ${filePath}`,
+			);
+		}
 		const r = await analyzeVideo(
 			s.aiBaseUrl,
 			s.aiApiKey,
 			s.aiModel,
 			videoUrl,
 			audioBase64 ?? undefined,
+			videoBase64 ?? undefined,
 		);
 		if ("error" in r) {
 			this.session.log(`AI 视频分析失败（跳过，不影响同步）：${filePath} ${r.error}`);
