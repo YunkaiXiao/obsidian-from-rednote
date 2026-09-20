@@ -190,3 +190,10 @@
 - 内容 hash 增量索引 noteIndex（sha256，源数据字段；URL 以 path 规范化入 hash——query 是易变签名 token）替代 syncedNoteIds（一次性迁移，hash="" 哨兵=对账不重写不下载，旧笔记不被触碰）；hash 相同跳过、变化重写并**原样保留旧文 AI 小节**（## 🤖 AI 摘要 至 EOF）
 - 评审 5 项修复：重写就地写（标题变才换名并删旧文，防副本堆积）；限速预算按详情请求计费（三路径一致）；下载溢出先 settle 再 destroy（防永久挂起）+ close/aborted 兜底；无后缀 URL 按 seq 复用已存在文件（防重复下载）；hash 去 query/fragment
 - 174/174 单测（+73）；真机未验证：新鲜 CDN URL 实际下载、大视频落盘、迁移后首次对账全流程（9 篇旧笔记逐篇对账，受限速约束）
+
+## ADR-022 M4.1 完成 + 关键帧时长比例制 + v0.1.0 发版（2026-09-21）
+
+- M4.1 插件 AI 轨道全部真机验证通过：图片分析（OCR 优先三段式）、视频分析（完整视频 base64 直传原生音视频——用户实证方案；远程 URL 会被服务端抽帧丢音轨）、关键帧（模型关键时刻 + ffmpeg 流式 seek 抽帧 + 容错解析：MM:SS 归一/单引号修复/裸 JSON 始终剥离）、三级降级（完整直传 > 远程 URL > 纯远程，audio_url 因服务 400 默认不发）
+- 关键帧数量改为时长比例制：基础额度（默认 8）+ 每多 5 分钟 +4，上限 60；aiKeyframesEnabled（默认开）与 aiKeyframeCount 设置项落地（ADR-016 补全）
+- 历程要点：图片线修复链 = http 协议适配 + 显式 Content-Length（chunked 编码破坏本地服务）；webp 不显示根因 = 相对路径在收藏夹子目录错位（改 vault 绝对路径 + fix-media-paths 命令）；frontmatter 破损两因 = 正文 --- 干扰（转 ***）与多行标题（yamlScalar 折叠换行）
+- 发版：v0.1.0 打 tag，GitHub Actions 自动构建发布（main.js/manifest.json/styles.css）
