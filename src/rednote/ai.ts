@@ -436,14 +436,112 @@ export interface VideoKeyMoment {
 const KEYFRAMES_SUBHEADING = "### 关键帧";
 
 /**
+ * Normalize one raw key-moment item: `t` may be a number or a timestamp
+ * string ("SS" / "M:SS" / "MM:SS" / "H:MM:SS", normalized to seconds);
+ * `why` must be a non-empty string. Unparseable items are dropped. Pure.
+ */
+function normalizeKeyMomentItem(item: unknown): VideoKeyMoment | null {
+	const it = item as { t?: unknown; why?: unknown } | null;
+	if (!it || typeof it !== "object") {
+		return null;
+	}
+	let t: number;
+	if (typeof it.t === "number") {
+		t = it.t;
+	} else if (typeof it.t === "string") {
+		const s = it.t.trim();
+		if (/^\d+(\.\d+)?$/.test(s)) {
+			t = Number(s);
+		} else {
+			const parts = s.split(":").map((p) => p.trim());
+			if (
+				parts.length < 2 ||
+				parts.length > 3 ||
+				!parts.every((p) => /^\d+$/.test(p))
+			) {
+				return null;
+			}
+			t = 0;
+			for (const p of parts) {
+				t = t * 60 + Number(p);
+			}
+		}
+	} else {
+		return null;
+	}
+	if (typeof it.why !== "string" || !it.why.trim()) {
+		return null;
+	}
+	return Number.isFinite(t) && t >= 0 ? { t, why: it.why.trim() } : null;
+}
+
+/**
+ * Best-effort textual repair of a near-JSON key-moments block before
+ * JSON.parse: single-quoted keys/values -> double quotes, trailing commas
+ * removed. Pure, never throws.
+ */
+function repairJsonKeyMoments(body: string): string {
+	let out = (body ?? "").replace(/'([^'\\\n]*)'\s*:/g, '"$1":');
+	out = out.replace(/:\s*'([^'\\\n]*)'/g, ': "$1"');
+	out = out.replace(/,(\s*[}\]])/g, "$1");
+	return out;
+}
+
+/** Safe JSON.parse -> unknown[] (empty on any failure). */
+function tryParseKeyMoments(body: string): unknown[] {
+	try {
+		const parsed = JSON.parse(body) as unknown;
+		return Array.isArray(parsed) ? parsed : [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Last-resort regex mining of `{"t": ..., "why": ...}` items from a block
+ * that could not be JSON.parse'd even after repairs (e.g. single-quoted
+ * values, MM:SS string timestamps mixed with prose). Pure.
+ */
+function mineKeyMoments(body: string): VideoKeyMoment[] {
+	const out: VideoKeyMoment[] = [];
+	const objRe = /\{[^{}]*\}/g;
+	let m: RegExpExecArray | null;
+	while ((m = objRe.exec(body ?? "")) !== null) {
+		const obj = m[0];
+		const tMatch = obj.match(/['"]?t['"]?\s*:\s*("?[\d:]+"?)/);
+		const whyMatch = obj.match(/['"]?why['"]?\s*:\s*'([^']*)'|['"]?why['"]?\s*:\s*"([^"]*)"/);
+		if (!tMatch || !whyMatch) {
+			continue;
+		}
+		const tRaw = (tMatch[1] ?? "").replace(/^"|"$/g, "");
+		const why = whyMatch[1] ?? whyMatch[2] ?? "";
+		out.push(normalizeKeyMomentItem({ t: tRaw, why }) as VideoKeyMoment);
+	}
+	return out.filter((x): x is VideoKeyMoment => x !== null);
+}
+
+/** Cap on the number of key moments honored per video. */
+const MAX_KEY_MOMENTS = 8;
+
+/**
  * Extract the trailing ```json code block's key-moments array from a video
- * transcription text. Tolerant: any malformed shape is ignored ([]) and the
- * text is returned unchanged; a successfully parsed block is STRIPPED from
- * the text so the note keeps only the prose. Pure, never throws.
+ * transcription text. Tolerant:
+ * - string timestamps ("MM:SS" ...) are normalized to seconds;
+ * - single-quoted values / trailing commas are repaired before JSON.parse;
+ * - items that still fail to normalize are dropped (valid ones kept);
+ * - when parsing fully fails, items are regex-mined from the raw block and
+ *   returned as `fallback` (text-only listing; no frame extraction).
+ * The ```json block is ALWAYS stripped from the returned text so raw JSON
+ * never reaches the note. Pure, never throws.
  */
 export function parseVideoKeyMoments(
 	text: string,
-): { text: string; keyMoments: VideoKeyMoment[] } {
+): {
+	text: string;
+	keyMoments: VideoKeyMoment[];
+	/** Text-only fallback items, present only when structured parsing failed. */
+	fallback?: VideoKeyMoment[];
+} {
 	const source = text ?? "";
 	const re = /```json\s*([\s\S]*?)```/;
 	const m = source.match(re);
@@ -451,27 +549,45 @@ export function parseVideoKeyMoments(
 	if (!body) {
 		return { text: source, keyMoments: [] };
 	}
-	let moments: VideoKeyMoment[] = [];
-	try {
-		const parsed = JSON.parse(body) as unknown;
-		if (Array.isArray(parsed)) {
-			moments = parsed
-				.map((item): VideoKeyMoment | null => {
-					const it = item as { t?: unknown; why?: unknown };
-					const t = typeof it?.t === "number" ? it.t : Number(it?.t);
-					const why = typeof it?.why === "string" ? it.why : "";
-					return Number.isFinite(t) && t >= 0 && why ? { t, why } : null;
-				})
-				.filter((x): x is VideoKeyMoment => x !== null);
-		}
-	} catch {
-		moments = [];
-	}
+	let moments = tryParseKeyMoments(body)
+		.map(normalizeKeyMomentItem)
+		.filter((x): x is VideoKeyMoment => x !== null);
 	if (moments.length === 0) {
-		return { text: source, keyMoments: [] };
+		moments = tryParseKeyMoments(repairJsonKeyMoments(body))
+			.map(normalizeKeyMomentItem)
+			.filter((x): x is VideoKeyMoment => x !== null);
+	}
+	let fallback: VideoKeyMoment[] | undefined;
+	if (moments.length === 0) {
+		const mined = mineKeyMoments(body);
+		if (mined.length > 0) {
+			fallback = mined.slice(0, MAX_KEY_MOMENTS);
+		}
+	} else if (moments.length > MAX_KEY_MOMENTS) {
+		moments = moments.slice(0, MAX_KEY_MOMENTS);
 	}
 	const stripped = source.replace(re, "").replace(/\n+$/, "\n");
-	return { text: stripped, keyMoments: moments };
+	return fallback
+		? { text: stripped, keyMoments: [], fallback }
+		: { text: stripped, keyMoments: moments };
+}
+
+/**
+ * Render the text-only fallback listing for key moments whose json block
+ * could not be parsed: one `- 第 X 秒：理由` line per item. Returns "" for an
+ * empty list. Pure.
+ */
+export function renderKeyMomentsFallback(
+	moments: readonly VideoKeyMoment[],
+): string {
+	const items = (moments ?? []).filter(
+		(m): m is VideoKeyMoment => !!m && typeof m.t === "number" && typeof m.why === "string",
+	);
+	if (items.length === 0) {
+		return "";
+	}
+	const lines = items.map((m) => `- 第 ${m.t} 秒：${m.why}`);
+	return `关键时刻（文字版）：\n${lines.join("\n")}`;
 }
 
 /**
@@ -873,7 +989,10 @@ export async function analyzeVideo(
 	videoUrl: string,
 	audioBase64?: string,
 	videoBase64?: string,
-): Promise<{ text: string; keyMoments?: VideoKeyMoment[] } | { error: string }> {
+): Promise<
+	| { text: string; keyMoments?: VideoKeyMoment[]; fallback?: VideoKeyMoment[] }
+	| { error: string }
+> {
 	try {
 		if (!videoUrl && !videoBase64) {
 			return { error: "没有可分析的视频链接" };
@@ -905,8 +1024,11 @@ export async function analyzeVideo(
 		if ("error" in parsedChat) {
 			return parsedChat;
 		}
-		const { text, keyMoments } = parseVideoKeyMoments(parsedChat.text);
-		return keyMoments.length > 0 ? { text, keyMoments } : { text };
+		const { text, keyMoments, fallback } = parseVideoKeyMoments(parsedChat.text);
+		if (keyMoments.length > 0) {
+			return { text, keyMoments };
+		}
+		return fallback && fallback.length > 0 ? { text, fallback } : { text };
 	} catch (e) {
 		return { error: e instanceof Error ? e.message : String(e) };
 	}

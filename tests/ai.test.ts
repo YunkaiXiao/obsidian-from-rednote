@@ -18,6 +18,7 @@ import {
 	IMAGE_ANALYSIS_PROMPT,
 	parseVideoKeyMoments,
 	renderKeyFramesSection,
+	renderKeyMomentsFallback,
 	applyKeyFrames,
 	extractKeyFrames,
 	resetFfmpegProbe,
@@ -420,11 +421,75 @@ describe("parseVideoKeyMoments", () => {
 		expect(r.text).toContain("转录正文");
 	});
 
-	it("ignores malformed blocks and keeps the text verbatim", () => {
+	it("ignores malformed blocks, strips them, and mines a text fallback", () => {
 		const src = "正文\n```json\n[{t: 12}]\n```";
 		const r = parseVideoKeyMoments(src);
 		expect(r.keyMoments).toEqual([]);
-		expect(r.text).toBe(src);
+		expect(r.text).not.toContain("```json");
+		expect(r.text).toContain("正文");
+		expect(r.fallback).toBeUndefined();
+	});
+
+	it("repairs single-quoted values and keys before parsing", () => {
+		const src = "正文\n```json\n[{'t': 63, 'why': '积极行为强化'}]\n```";
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([{ t: 63, why: "积极行为强化" }]);
+		expect(r.text).not.toContain("```json");
+	});
+
+	it("removes trailing commas", () => {
+		const src = '正文\n```json\n[{"t": 5, "why": "开头"},]\n```';
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([{ t: 5, why: "开头" }]);
+	});
+
+	it("normalizes MM:SS / H:MM:SS string timestamps to seconds", () => {
+		const src =
+			'正文\n```json\n[{"t": "00:00", "why": "a"},{"t": "01:03", "why": "b"},{"t": "1:02:03", "why": "c"}]\n```';
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([
+			{ t: 0, why: "a" },
+			{ t: 63, why: "b" },
+			{ t: 3723, why: "c" },
+		]);
+	});
+
+	it("keeps valid items and drops unparseable ones, capped at 8", () => {
+		const items = [
+			'{"t": "bad", "why": "x"}',
+			'{"t": 7, "why": "ok"}',
+			'{"t": 8}',
+			'{"t": "00:09", "why": "mmss"}',
+		];
+		for (let i = 0; i < 8; i++) {
+			items.push(`{"t": ${20 + i}, "why": "m${i}"}`);
+		}
+		const src = `正文\n\`\`\`json\n[${items.join(",")}]\n\`\`\``;
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toHaveLength(8);
+		expect(r.keyMoments[0]).toEqual({ t: 7, why: "ok" });
+		expect(r.keyMoments[1]).toEqual({ t: 9, why: "mmss" });
+		expect(r.keyMoments?.[7]?.t).toBe(25);
+		expect(r.fallback).toBeUndefined();
+	});
+
+	it("returns a text fallback list when the block is fully unparseable", () => {
+		const src =
+			"关键时刻是文本信息\n```json\n以上是关键时刻\n{\"t\": 63, \"why\": '积极行为强化'}\n{\"t\": \"02:05\", \"why\": '总结'}\n```";
+		const r = parseVideoKeyMoments(src);
+		expect(r.keyMoments).toEqual([]);
+		expect(r.fallback).toEqual([
+			{ t: 63, why: "积极行为强化" },
+			{ t: 125, why: "总结" },
+		]);
+		expect(r.text).not.toContain("```json");
+		expect(renderKeyMomentsFallback(r.fallback ?? [])).toBe(
+			"关键时刻（文字版）：\n- 第 63 秒：积极行为强化\n- 第 125 秒：总结",
+		);
+	});
+
+	it("renderKeyMomentsFallback is empty for no items", () => {
+		expect(renderKeyMomentsFallback([])).toBe("");
 	});
 
 	it("returns no moments when the block is missing", () => {

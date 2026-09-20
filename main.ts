@@ -34,6 +34,7 @@ import {
 	frontmatterHasSection,
 	frontmatterStringValue,
 	frontmatterTypeIsVideo,
+	renderKeyMomentsFallback,
 } from "./src/rednote/ai";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
@@ -572,7 +573,14 @@ export default class RedNoteSyncPlugin extends Plugin {
 		}
 		const adapter = this.app.vault.adapter;
 		let noteId = frontmatterStringValue(content, "note_id");
-		let newContent = applyVideoTranscript(content, s.aiModel, r.text);
+		// When the model's json block was unparseable, list the mined time
+		// points as plain text inside 视频转写 (applyVideoTranscript replaces
+		// the whole subsection, so re-runs stay idempotent).
+		let transcriptText = r.text;
+		if (r.fallback && r.fallback.length > 0) {
+			transcriptText = `${r.text}\n${renderKeyMomentsFallback(r.fallback)}`;
+		}
+		let newContent = applyVideoTranscript(content, s.aiModel, transcriptText);
 		// Key frames (ffmpeg): extract only when the model returned key moments;
 		// without ffmpeg or without moments no 关键帧 section is written.
 		if (r.keyMoments && r.keyMoments.length > 0) {
