@@ -291,6 +291,25 @@ describe("buildVideoRequestBody", () => {
 		const body = buildVideoRequestBody("", "p", "https://cdn/v.mp4");
 		expect("model" in body).toBe(false);
 	});
+
+	it("appends a qwen-style audio_url data-URI item after video_url when audio is given", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "QUJD");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		expect(content).toEqual([
+			{ type: "text", text: "p" },
+			{ type: "video_url", video_url: { url: "https://cdn/v.mp4" } },
+			{ type: "audio_url", audio_url: { url: "data:audio/mp3;base64,QUJD" } },
+		]);
+	});
+
+	it("does not append an audio item without audio (behavior unchanged)", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		expect(content).toHaveLength(2);
+		expect(content.some((c) => c["type"] === "audio_url")).toBe(false);
+	});
 });
 
 describe("frontmatterTypeIsVideo / extractVideoNoteUrl", () => {

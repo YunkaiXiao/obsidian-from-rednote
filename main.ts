@@ -25,6 +25,7 @@ import {
 	applyKeyFrames,
 	applyVideoTranscript,
 	chunkArray,
+	extractAudioBase64,
 	extractKeyFrames,
 	extractLocalImagePaths,
 	extractVideoNoteUrl,
@@ -537,7 +538,19 @@ export default class RedNoteSyncPlugin extends Plugin {
 			this.session.log(`AI 视频分析：视频链接缺失（旧笔记），跳过 ${filePath}`);
 			return "skip";
 		}
-		const r = await analyzeVideo(s.aiBaseUrl, s.aiApiKey, s.aiModel, videoUrl);
+		// Audio track (same video URL, ffmpeg -> base64 mp3): passed alongside
+		// the video_url item when extraction succeeds; on failure / over-size
+		// the call proceeds video-only (previous behavior), never blocking.
+		const audioBase64 = await extractAudioBase64(videoUrl, (line) =>
+			this.session.log(line),
+		);
+		const r = await analyzeVideo(
+			s.aiBaseUrl,
+			s.aiApiKey,
+			s.aiModel,
+			videoUrl,
+			audioBase64 ?? undefined,
+		);
 		if ("error" in r) {
 			this.session.log(`AI 视频分析失败（跳过，不影响同步）：${filePath} ${r.error}`);
 			return "fail";

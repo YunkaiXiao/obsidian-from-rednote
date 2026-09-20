@@ -37,7 +37,9 @@ const VIDEO_SUBHEADING = "### 视频转写";
 
 /** Chinese prompt sent with every video transcription call (task contract wording). */
 export const VIDEO_ANALYSIS_PROMPT =
-	"转写并总结这个小红书视频：1) 完整中文转录稿（保留口语）；2) 三句话摘要；\n" +
+	"你会同时收到视频画面帧与完整音频轨，请以音频语音为准输出完整转录稿（保留口语），" +
+	"画面字幕作为补充。转写并总结这个小红书视频：\n" +
+	"1) 完整中文转录稿（保留口语）；2) 三句话摘要；\n" +
 	"3. 【关键时刻】列出 3-5 个最值得截图的关键时间点，JSON 数组格式 " +
 	'[{"t": 秒数, "why": "一句话"}]，放在输出末尾的 ```json 代码块中';
 
@@ -89,17 +91,27 @@ export function arrayBufferToBase64(buf: ArrayBuffer): string {
  *
  * @param model    Model name; "" omits the field (server default).
  * @param prompt   Text prompt.
- * @param videoUrl Direct video URL (CDN-signed link).
+ * @param videoUrl    Direct video URL (CDN-signed link).
+ * @param audioBase64 Optional base64 of the video's audio track (mp3). When
+ *                    present, a qwen-style `audio_url` item (data URI) is
+ *                    appended after the video_url item.
  */
 export function buildVideoRequestBody(
 	model: string,
 	prompt: string,
 	videoUrl: string,
+	audioBase64?: string,
 ): Record<string, unknown> {
 	const content: Array<Record<string, unknown>> = [
 		{ type: "text", text: prompt },
 		{ type: "video_url", video_url: { url: videoUrl } },
 	];
+	if (audioBase64) {
+		content.push({
+			type: "audio_url",
+			audio_url: { url: `data:audio/mp3;base64,${audioBase64}` },
+		});
+	}
 	const body: Record<string, unknown> = {
 		messages: [{ role: "user", content }],
 	};
@@ -722,13 +734,14 @@ export async function analyzeVideo(
 	apiKey: string,
 	model: string,
 	videoUrl: string,
+	audioBase64?: string,
 ): Promise<{ text: string; keyMoments?: VideoKeyMoment[] } | { error: string }> {
 	try {
 		if (!videoUrl) {
 			return { error: "没有可分析的视频链接" };
 		}
 		const body = JSON.stringify(
-			buildVideoRequestBody(model, VIDEO_ANALYSIS_PROMPT, videoUrl),
+			buildVideoRequestBody(model, VIDEO_ANALYSIS_PROMPT, videoUrl, audioBase64),
 		);
 		const url = `${(baseUrl ?? "").replace(/\/+$/, "")}/chat/completions`;
 		const headers: Record<string, string> = {
@@ -869,6 +882,102 @@ function ffmpegExtractFrame(
 			done(false);
 		}
 	});
+}
+
+/** Max audio payload handed to the model API (guard against RAM / request
+ * body blowups on very long videos): 20MB of mp3 bytes. */
+const AUDIO_MAX_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Extract a video's audio track as base64 mp3 via ffmpeg, streaming to stdout
+ * (`ffmpeg -i {url} -vn -acodec libmp3lame -q:a 5 -f mp3 pipe:1`): no temp
+ * file is written. 60s timeout, argument-array spawn (no shell). Returns null
+ * on any failure (ffmpeg unavailable, non-zero exit, timeout, over-size
+ * payload) and reports the reason via `log` — callers then fall back to
+ * video-only analysis. NEVER throws.
+ */
+export async function extractAudioBase64(
+	videoUrl: string,
+	log?: (line: string) => void,
+): Promise<string | null> {
+	if (!videoUrl) {
+		return null;
+	}
+	if (!isFfmpegAvailable()) {
+		log?.("音轨抽取：ffmpeg 不可用，跳过（仅视频通道）");
+		return null;
+	}
+	const mods = nodeRequire();
+	if (!mods) {
+		log?.("音轨抽取：Node child_process 模块不可用，跳过（仅视频通道）");
+		return null;
+	}
+	try {
+		const buf = await new Promise<Buffer | null>((resolve) => {
+			let settled = false;
+			const done = (b: Buffer | null): void => {
+				if (!settled) {
+					settled = true;
+					resolve(b);
+				}
+			};
+			const child = mods.cp.spawn(
+				"ffmpeg",
+				[
+					"-i",
+					videoUrl,
+					"-vn",
+					"-acodec",
+					"libmp3lame",
+					"-q:a",
+					"5",
+					"-f",
+					"mp3",
+					"pipe:1",
+				],
+				{ windowsHide: true },
+			);
+			const chunks: Buffer[] = [];
+			let total = 0;
+			const timer = setTimeout(() => {
+				child.kill();
+				done(null);
+			}, 60_000);
+			child.stdout?.on("data", (c: Buffer) => {
+				total += c.length;
+				if (total > AUDIO_MAX_BYTES) {
+					child.kill();
+					return;
+				}
+				chunks.push(c);
+			});
+			child.on("error", () => {
+				clearTimeout(timer);
+				done(null);
+			});
+			child.on("close", (code) => {
+				clearTimeout(timer);
+				if (total > AUDIO_MAX_BYTES) {
+					log?.(
+						`音轨抽取：音频超过 ${AUDIO_MAX_BYTES} 字节上限，放弃（仅视频通道）`,
+					);
+					done(null);
+					return;
+				}
+				done(code === 0 && total > 0 ? Buffer.concat(chunks) : null);
+			});
+		});
+		if (!buf) {
+			log?.("音轨抽取：ffmpeg 未能提取音轨（仅视频通道）");
+			return null;
+		}
+		return buf.toString("base64");
+	} catch (e) {
+		log?.(
+			`音轨抽取失败（仅视频通道）：${e instanceof Error ? e.message : String(e)}`,
+		);
+		return null;
+	}
 }
 
 /**
