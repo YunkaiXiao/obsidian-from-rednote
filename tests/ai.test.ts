@@ -293,8 +293,20 @@ describe("buildVideoRequestBody", () => {
 		expect("model" in body).toBe(false);
 	});
 
-	it("appends a qwen-style audio_url data-URI item after video_url when audio is given", () => {
+	it("audio_url suppressed by default (server rejects it with HTTP 400)", () => {
 		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "QUJD");
+		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
+			?.content as Array<Record<string, unknown>>;
+		expect(content).toEqual([
+			{ type: "text", text: "p" },
+			{ type: "video_url", video_url: { url: "https://cdn/v.mp4" } },
+		]);
+	});
+
+	it("audio_url appended only when opts.includeAudioUrl is set", () => {
+		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "QUJD", undefined, {
+			includeAudioUrl: true,
+		});
 		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
 			?.content as Array<Record<string, unknown>>;
 		expect(content).toEqual([
@@ -331,14 +343,13 @@ describe("buildVideoRequestBody", () => {
 		expect(content.some((c) => c["type"] === "audio_url")).toBe(false);
 	});
 
-	it("keeps the remote video_url + audio_url combination without videoBase64 (fallback path)", () => {
+	it("fallback path stays remote video_url only (audio_url opt-in)", () => {
 		const body = buildVideoRequestBody("m", "p", "https://cdn/v.mp4", "REVG");
 		const content = (body["messages"] as Array<{ content: Array<Record<string, unknown>> }>)[0]
 			?.content as Array<Record<string, unknown>>;
 		expect(content).toEqual([
 			{ type: "text", text: "p" },
 			{ type: "video_url", video_url: { url: "https://cdn/v.mp4" } },
-			{ type: "audio_url", audio_url: { url: "data:audio/mp3;base64,REVG" } },
 		]);
 	});
 });

@@ -60,6 +60,12 @@ export interface RedNoteSyncSettings {
 	aiExecutor: "plugin" | "zcode";
 	/** M4.1: notes per batch for the AI backfill command (1-50). */
 	aiBatchSize: number;
+	/** M4.1.6 (ADR-016): key-frame extraction toggle (default ON — the user
+	 * uses frames; off = text-only timestamp list). */
+	aiKeyframesEnabled: boolean;
+	/** M4.1.6 (ADR-016): BASE key-frame allowance for the duration curve
+	 * (keyMomentCapForDuration: base + 4 per extra 5min, ceiling 60). */
+	aiKeyframeCount: number;
 	tagPrefix: string;
 	notesFolder: string;
 	mediaFolder: string;
@@ -92,6 +98,8 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	aiModel: "",
 	aiExecutor: "plugin",
 	aiBatchSize: 10,
+	aiKeyframesEnabled: true,
+	aiKeyframeCount: 8,
 	tagPrefix: "xhs/",
 	notesFolder: "RedNote/Bookmarks",
 	mediaFolder: "RedNote/Media",
@@ -566,6 +574,7 @@ export default class RedNoteSyncPlugin extends Plugin {
 			videoUrl,
 			audioBase64 ?? undefined,
 			videoBase64 ?? undefined,
+			{ baseAllowance: Math.min(60, Math.max(1, Math.floor(s.aiKeyframeCount) || 8)) },
 		);
 		if ("error" in r) {
 			this.session.log(`AI 视频分析失败（跳过，不影响同步）：${filePath} ${r.error}`);
@@ -581,9 +590,19 @@ export default class RedNoteSyncPlugin extends Plugin {
 			transcriptText = `${r.text}\n${renderKeyMomentsFallback(r.fallback)}`;
 		}
 		let newContent = applyVideoTranscript(content, s.aiModel, transcriptText);
-		// Key frames (ffmpeg): extract only when the model returned key moments;
-		// without ffmpeg or without moments no 关键帧 section is written.
-		if (r.keyMoments && r.keyMoments.length > 0) {
+		// Key frames (ffmpeg): extract only when the model returned key moments
+		// AND the user toggle allows it (ADR-016: aiKeyframesEnabled); with the
+		// toggle off, the timestamps live on as the text-only list above.
+		// aiKeyframeCount acts as the BASE allowance of the duration curve
+		// (keyMomentCapForDuration: base + 4 per extra 5min, ceiling 60).
+		const kfAllowed = s.aiKeyframesEnabled !== false;
+		if (!kfAllowed) {
+			if (r.keyMoments && r.keyMoments.length > 0) {
+				this.session.log(`关键帧开关已关闭，仅保留文字版时间点：${filePath}`);
+				transcriptText = `${transcriptText}\n${renderKeyMomentsFallback(r.keyMoments)}`;
+				newContent = applyVideoTranscript(content, s.aiModel, transcriptText);
+			}
+		} else if (r.keyMoments && r.keyMoments.length > 0) {
 			if (!noteId) {
 				// Fall back to the file stem when frontmatter lacks note_id.
 				noteId = filePath.slice(filePath.lastIndexOf("/") + 1).replace(/\.md$/i, "");
@@ -968,6 +987,38 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 				b.setButtonText("AI 补处理").onClick(() => {
 					void this.plugin.runAiBackfill();
 				});
+			});
+
+		new Setting(containerEl)
+			.setName("视频关键帧")
+			.setDesc(
+				"开启后对视频笔记按 AI 关键时刻自动抽帧存图；关闭则仅保留文字版时间点清单",
+			)
+			.addToggle((t: ToggleComponent) => {
+				t.setValue(settings.aiKeyframesEnabled !== false).onChange(async (v) => {
+					settings.aiKeyframesEnabled = v;
+					await this.plugin.saveSettings();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("关键帧基础数量")
+			.setDesc(
+				"短视频（5 分钟内）的关键帧基础额度（1-60）；长视频按每多 5 分钟 +4 张自动扩展（上限 60）",
+			)
+			.addText((text: TextComponent) => {
+				text.inputEl.type = "number";
+				text
+					.setPlaceholder("8")
+					.setValue(String(settings.aiKeyframeCount))
+					.onChange(async (value: string) => {
+						const parsed = Number(value);
+						settings.aiKeyframeCount =
+							Number.isFinite(parsed) && parsed >= 1
+								? Math.min(60, Math.max(1, Math.floor(parsed)))
+								: 8;
+						await this.plugin.saveSettings();
+					});
 			});
 
 		new Setting(containerEl)

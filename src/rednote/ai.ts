@@ -39,8 +39,10 @@ const VIDEO_SUBHEADING = "### 视频转写";
 export const VIDEO_ANALYSIS_PROMPT =
 	"你会收到完整视频（含画面与音频）。请输出：\n" +
 	"1) 完整中文/原文语音转录稿（口语原样）；2) 三句话摘要；\n" +
-	"3. 【关键时刻】3-5 个值得截图的时间点，JSON 数组格式 " +
-	'[{"t": 秒, "why": "理由"}]，放在输出末尾的 ```json 代码块中';
+	"3. 【关键时刻】值得截图的时间点——短视频（5 分钟内）给 4-8 个，" +
+	"长视频每多 5 分钟多给 4 个（如 20 分钟视频给约 16 个），" +
+	"覆盖视频各阶段不要集中在开头；JSON 数组格式 " +
+	'[{"t": 秒数字, "why": "理由"}]（t 必须是数字秒数，不要用 "MM:SS" 字符串），放在输出末尾的 ```json 代码块中';
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -107,7 +109,9 @@ export function buildVideoRequestBody(
 	videoUrl: string,
 	audioBase64?: string,
 	videoBase64?: string,
+	opts: { includeAudioUrl?: boolean } = {},
 ): Record<string, unknown> {
+	const includeAudioUrl = opts.includeAudioUrl === true;
 	const videoUrlValue = videoBase64
 		? `data:video/mp4;base64,${videoBase64}`
 		: videoUrl;
@@ -116,10 +120,17 @@ export function buildVideoRequestBody(
 		{ type: "video_url", video_url: { url: videoUrlValue } },
 	];
 	if (audioBase64 && !videoBase64) {
-		content.push({
-			type: "audio_url",
-			audio_url: { url: `data:audio/mp3;base64,${audioBase64}` },
-		});
+		// NOTE: disabled by default — the user's server rejects audio_url
+		// ("Unexpected item type in content", HTTP 400) while accepting
+		// text/video_url/image_url. Kept behind opts.includeAudioUrl so the
+		// degraded path stays a pure remote-video_url request unless a server
+		// is known to support audio_url.
+		if (includeAudioUrl) {
+			content.push({
+				type: "audio_url",
+				audio_url: { url: `data:audio/mp3;base64,${audioBase64}` },
+			});
+		}
 	}
 	const body: Record<string, unknown> = {
 		messages: [{ role: "user", content }],
@@ -520,8 +531,25 @@ function mineKeyMoments(body: string): VideoKeyMoment[] {
 	return out.filter((x): x is VideoKeyMoment => x !== null);
 }
 
-/** Cap on the number of key moments honored per video. */
-const MAX_KEY_MOMENTS = 8;
+/** Default cap on key moments per video (settings can raise this). */
+export const DEFAULT_MAX_KEY_MOMENTS = 8;
+
+/**
+ * Duration-proportional key-moment cap (user request: long videos get more
+ * frames — "每多少分钟就能截多少张"). Base allowance of 8 for the first
+ * 5 minutes, +4 per additional 5 minutes, hard ceiling 60. The settings
+ * value (when set) acts as the BASE allowance for the same curve, so the
+ * setting scales the whole curve rather than a flat limit.
+ */
+export function keyMomentCapForDuration(
+	videoSeconds: number | undefined,
+	baseAllowance = DEFAULT_MAX_KEY_MOMENTS,
+): number {
+	const secs = videoSeconds && videoSeconds > 0 ? videoSeconds : 0;
+	const minutes = secs / 60;
+	const cap = baseAllowance + Math.floor(minutes / 5) * 4;
+	return Math.min(cap, 60);
+}
 
 /**
  * Extract the trailing ```json code block's key-moments array from a video
@@ -536,6 +564,7 @@ const MAX_KEY_MOMENTS = 8;
  */
 export function parseVideoKeyMoments(
 	text: string,
+	opts: { baseAllowance?: number } = {},
 ): {
 	text: string;
 	keyMoments: VideoKeyMoment[];
@@ -557,14 +586,23 @@ export function parseVideoKeyMoments(
 			.map(normalizeKeyMomentItem)
 			.filter((x): x is VideoKeyMoment => x !== null);
 	}
+	// Duration-proportional cap: the largest timestamp the model returned is a
+	// good proxy for the video's length when no explicit duration is known.
+	const inferredSeconds = moments.length
+		? Math.max(...moments.map((x) => x.t))
+		: undefined;
+	const cap = keyMomentCapForDuration(
+		inferredSeconds,
+		opts.baseAllowance ?? DEFAULT_MAX_KEY_MOMENTS,
+	);
 	let fallback: VideoKeyMoment[] | undefined;
 	if (moments.length === 0) {
 		const mined = mineKeyMoments(body);
 		if (mined.length > 0) {
-			fallback = mined.slice(0, MAX_KEY_MOMENTS);
+			fallback = mined.slice(0, cap);
 		}
-	} else if (moments.length > MAX_KEY_MOMENTS) {
-		moments = moments.slice(0, MAX_KEY_MOMENTS);
+	} else if (moments.length > cap) {
+		moments = moments.slice(0, cap);
 	}
 	const stripped = source.replace(re, "").replace(/\n+$/, "\n");
 	return fallback
@@ -989,6 +1027,7 @@ export async function analyzeVideo(
 	videoUrl: string,
 	audioBase64?: string,
 	videoBase64?: string,
+	opts: { baseAllowance?: number } = {},
 ): Promise<
 	| { text: string; keyMoments?: VideoKeyMoment[]; fallback?: VideoKeyMoment[] }
 	| { error: string }
@@ -1024,7 +1063,7 @@ export async function analyzeVideo(
 		if ("error" in parsedChat) {
 			return parsedChat;
 		}
-		const { text, keyMoments, fallback } = parseVideoKeyMoments(parsedChat.text);
+		const { text, keyMoments, fallback } = parseVideoKeyMoments(parsedChat.text, opts);
 		if (keyMoments.length > 0) {
 			return { text, keyMoments };
 		}
