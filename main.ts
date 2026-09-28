@@ -18,6 +18,7 @@ import { syncFavorites, makeSummaryNotice } from "./src/rednote/sync";
 import { RedNoteLoginModal, LOGIN_LEAF_VIEW_TYPE } from "./src/rednote/login";
 import { epochToIso, fixMediaEmbedPaths } from "./src/rednote/markdown";
 import {
+	AI_SECTION_IMAGE,
 	AI_SECTION_VIDEO,
 	analyzeImages,
 	analyzeVideo,
@@ -565,6 +566,21 @@ export default class RedNoteSyncPlugin extends Plugin {
 	): Promise<"ok" | "skip" | "fail"> {
 		const s = this.settings;
 		if (frontmatterHasSection(content, AI_SECTION_VIDEO)) {
+			// Already transcribed. TERMINAL-STATE CLOSE-OUT (2026-09-29 fix):
+			// a finished video note still lacked the image_analysis marker (its
+			// writer only runs on the image branch), so the backfill scanner
+			// re-listed it forever. Close it out: no local images on a video
+			// note transcript — stamp the image marker too.
+			if (!frontmatterHasSection(content, AI_SECTION_IMAGE)) {
+				const closed = applyImageAnalysis(
+					content,
+					s.aiModel,
+					"（视频笔记，无本地图片）",
+				);
+				await this.app.vault.adapter.write(filePath, closed);
+				this.session.log(`终态补标：视频已转写、补 image_analysis 标记 ${filePath}`);
+				return "ok";
+			}
 			return "skip";
 		}
 		const videoUrl = extractVideoNoteUrl(content);
@@ -572,7 +588,16 @@ export default class RedNoteSyncPlugin extends Plugin {
 			// Old notes synced before the 2026 video extraction fix have no
 			// playable link (CDN URLs also expire) — skip WITHOUT re-calling
 			// the detail API (deep backfill is the M4.2 ZCode track).
-			this.session.log(`AI 视频分析：视频链接缺失（旧笔记），跳过 ${filePath}`);
+			// TERMINAL-STATE: write the skip INTO the note (transcript section
+			// explaining why + both markers) so the scanner stops re-listing
+			// these notes on every backfill run.
+			const closed = applyVideoTranscript(
+				applyImageAnalysis(content, s.aiModel, "（视频笔记，无本地图片）"),
+				s.aiModel,
+				"（未转写：该笔记落盘早于视频链接提取修复，正文中无可播放的视频链接；如需转写请重新同步该笔记或使用 ZCode 深度回填）",
+			);
+			await this.app.vault.adapter.write(filePath, closed);
+			this.session.log(`终态关闭：视频链接缺失，写入跳过说明与标记 ${filePath}`);
 			return "skip";
 		}
 		// Full-video base64 (no ffmpeg): download the complete mp4 and pass it
