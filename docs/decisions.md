@@ -197,3 +197,10 @@
 - 关键帧数量改为时长比例制：基础额度（默认 8）+ 每多 5 分钟 +4，上限 60；aiKeyframesEnabled（默认开）与 aiKeyframeCount 设置项落地（ADR-016 补全）
 - 历程要点：图片线修复链 = http 协议适配 + 显式 Content-Length（chunked 编码破坏本地服务）；webp 不显示根因 = 相对路径在收藏夹子目录错位（改 vault 绝对路径 + fix-media-paths 命令）；frontmatter 破损两因 = 正文 --- 干扰（转 ***）与多行标题（yamlScalar 折叠换行）
 - 发版：v0.1.0 打 tag，GitHub Actions 自动构建发布（main.js/manifest.json/styles.css）
+
+## ADR-023 失效视频链接的深度回填归 ZCode 轨道（2026-09-29，用户确认）
+
+- 73 篇旧视频笔记（落盘早于视频链接提取修复）正文无可播放链接，插件内无法转写；用户决策：**不做插件侧"强制重取"命令，统一走 M4.2 ZCode 深度回填**
+- 理由：不保证用户首次使用时就配置好了后端 LLM——首次同步时无 AI 是常态，链接缺失类欠账应由异步批处理（ZCode 会话按协议重调 note detail API 拿新鲜视频 URL → 转写/关键帧 → 写回）偿还
+- 插件侧终态标记（54a0e2d）已把这些笔记标注为"未转写：链接缺失"，ZCode 协议可据此发现它们
+- M4.2 协议文档（ai-backfill-protocol.md）的发现规则相应包含：a) ai_sections 缺 image_analysis；b) 视频笔记缺 video_transcript；c) 转写小节含"未转写：…链接缺失"说明的笔记
