@@ -1663,7 +1663,16 @@ export class RedNoteSession {
 				`，页面请求=${p.pageReqs ? p.pageReqs.slice(0, 120) : "无"}`;
 			// loggedIn === true is the authoritative signal; fall back to
 			// hasUserData only when the field is absent (unexpected shape).
-			const ok = p.loggedIn === "true" || (p.loggedIn !== "false" && Boolean(p.hasUserData));
+			let ok = p.loggedIn === "true" || (p.loggedIn !== "false" && Boolean(p.hasUserData));
+			// 2026-09-29 XHS redesign fallback: the page's SSR no longer
+			// exposes __INITIAL_STATE.user, but a LOGGED-IN page still fires its
+			// own business requests (unread_count &c.) that succeed with 200 —
+			// those are recorded in pageReqs ("200<url>"). A 200 business
+			// response from the page itself is a strong logged-in signal.
+			if (!ok && /200</.test(p.pageReqs ?? "") && p.cookieA1) {
+				ok = true;
+				this.log("登录检测：SSR 字段缺失（改版），以页面自发业务请求 200 + a1 判定已登录");
+			}
 			return { ok, info };
 		} catch (e) {
 			return { ok: false, info: `页面探测失败：${e instanceof Error ? e.message : String(e)}` };
