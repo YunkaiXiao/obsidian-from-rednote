@@ -9,6 +9,7 @@ Sync your RedNote（小红书）favorites/collections into a local Obsidian vaul
 - 同步小红书收藏夹中的笔记：标题、正文、图片、作者、标签、原文链接
 - 转换为带 frontmatter 的 Markdown，附件（图片等）归档到 vault
 - 支持增量同步，不重复下载已有内容
+- 支持自动定时同步（可选间隔，默认关闭；受限速约束，登录失效时不自动弹窗）
 
 ## 当前状态
 

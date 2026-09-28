@@ -211,3 +211,10 @@
 - 动态同步（自己发帖备份）：移除——用户非创作者模式，变通方案存在（收藏自己的帖子）
 - 路线图主力变更为：自动定时同步（真实体验差异）→ M4.2 ZCode 协议 → v0.2 发版
 - features.md #3 的"后续版本"部分标记 ❌
+
+## ADR-025 M5：自动定时同步（2026-09-29）
+
+- 决策：分钟粒度中央 tick——onload 注册 `registerInterval(setInterval(tick, 60_000))`，每分钟用纯决策函数 `shouldAutoSync`（src/rednote/autosync.ts）判断是否触发；新设置 `autoSyncMinutes`（0=关闭，默认关闭；可选 15/30/60/180/360/720/1440 分钟），tick 每次读当前设置，改设置即时生效，无需重建 timer
+- lastAutoSyncAt（epoch ms）持久化到 data.json，且在 runSync 启动**之前**先打点——防插件重载/Obsidian 重启后的补跑风暴；长期关闭后重开时首个 tick 恰好补跑一次（期望行为）
+- 自动路径安全约束：`runSync(auto=true)` 在 gate1/gate2 登录失效时仅 `Notice("自动同步：登录已过期，请手动登录")` + session.log 后返回，**绝不自动打开登录 leaf**（防无人值守弹窗循环）；手动同步行为完全不变（runSync 本就不自开登录窗，auto 分支只是改写提示文案并早退）
+- 可观测性：触发时 `⏱ 自动同步已启动` Notice + session.log；设置页「自动同步」区块渲染下次预计同步时间；慢速限速逻辑（ADR-014/021）对自动路径完全复用，不做任何放宽

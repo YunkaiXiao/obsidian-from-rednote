@@ -39,6 +39,11 @@ import {
 } from "./src/rednote/ai";
 import { hasLegacyNoteIds, migrateLegacyNoteIds, type NoteIndex } from "./src/rednote/hash";
 import {
+	AUTO_SYNC_OPTIONS,
+	shouldAutoSync,
+	nextAutoSyncAtMs,
+} from "./src/rednote/autosync";
+import {
 	evaluateRateLimit,
 	normalizeRateLimitState,
 	parseRateLimitConfig,
@@ -86,6 +91,14 @@ export interface RedNoteSyncSettings {
 	rateLimitWindowMinutes: number;
 	/** Rate limit: persisted window budget state (survives restarts). */
 	rateLimitState: RateLimitState | null;
+	/**
+	 * M5 (ADR-025): auto sync interval in minutes; 0 = off (default).
+	 * Conservative by design — must stay slow, the 1-minute tick only
+	 * decides, the sync itself keeps every rate limit.
+	 */
+	autoSyncMinutes: number;
+	/** M5: epoch ms of the last auto-sync trigger (persisted; 0 = never). */
+	lastAutoSyncAt: number;
 	/** Last captured header set of the page's own successful edith requests
 	 * (Service-Tag, c_device_id …) — mirrored onto our outbound requests. */
 	pageHeaders: Record<string, string> | null;
@@ -110,6 +123,8 @@ const DEFAULT_SETTINGS: RedNoteSyncSettings = {
 	rateLimitMaxNotes: 20,
 	rateLimitWindowMinutes: 10,
 	rateLimitState: null,
+	autoSyncMinutes: 0,
+	lastAutoSyncAt: 0,
 	pageHeaders: null,
 };
 
@@ -227,6 +242,39 @@ export default class RedNoteSyncPlugin extends Plugin {
 				void this.runFixMediaPaths();
 			},
 		});
+
+		// M5 (ADR-025): central 1-minute tick for the auto sync. The tick
+		// reads the CURRENT settings each time, so a settings change takes
+		// effect immediately without rebuilding the timer. Decision logic is
+		// the pure shouldAutoSync (src/rednote/autosync.ts).
+		this.registerInterval(
+			window.setInterval(() => this.autoSyncTick(), 60_000),
+		);
+	}
+
+	/**
+	 * M5 (ADR-025): one tick of the auto scheduler. Fires runSync in auto
+	 * mode when due; lastAutoSyncAt is stamped + persisted BEFORE the run
+	 * starts so a long plugin restart / Obsidian closure catches up exactly
+	 * once instead of storming.
+	 */
+	private autoSyncTick(): void {
+		const now = Date.now();
+		if (
+			!shouldAutoSync({
+				now,
+				lastAutoSyncAt: this.settings.lastAutoSyncAt,
+				autoSyncMinutes: this.settings.autoSyncMinutes,
+				syncRunning: this.syncing,
+			})
+		) {
+			return;
+		}
+		this.settings.lastAutoSyncAt = now;
+		void this.saveSettings();
+		this.session.log(`自动同步触发（间隔 ${this.settings.autoSyncMinutes} 分钟）`);
+		new Notice("⏱ 自动同步已启动", 5000);
+		void this.runSync(true);
 	}
 
 	onunload(): void {
@@ -307,15 +355,26 @@ export default class RedNoteSyncPlugin extends Plugin {
 		window.setTimeout(() => this.settingTab?.display(), 0);
 	}
 
-	/** The core sync command (M2). */
-	async runSync(): Promise<void> {
+	/**
+	 * The core sync command (M2).
+	 *
+	 * M5 (ADR-025): `auto = true` marks the scheduler-driven path. The ONLY
+	 * behavioral difference is at the login gates — the auto path never
+	 * prompts the user to open a login window mid-run and never opens one
+	 * itself (no unattended popup loops); it just Notifies + logs and
+	 * returns. Manual behavior is unchanged.
+	 */
+	async runSync(auto = false): Promise<void> {
 		if (this.syncing) {
 			new Notice("同步正在进行中，请稍候");
 			return;
 		}
 		// Immediate feedback: the login gates + retries below can take tens of
 		// seconds before the first progress notice — show activity at once.
-		new Notice("正在同步小红书收藏…");
+		// (Auto mode already announced itself via "⏱ 自动同步已启动".)
+		if (!auto) {
+			new Notice("正在同步小红书收藏…");
+		}
 
 		// Gate 1: login. The persisted flag can be STALE (a historical
 		// misreport once flipped it false while the session was alive), so
@@ -332,6 +391,12 @@ export default class RedNoteSyncPlugin extends Plugin {
 				await this.saveSettings();
 				this.settingTab?.display();
 			} else {
+				if (auto) {
+					// ADR-025: never pop a login window on the auto path.
+					this.session.log("自动同步：登录状态不可用（gate1），本轮放弃");
+					new Notice("自动同步：登录已过期，请手动登录", 8000);
+					return;
+				}
 				new Notice("尚未登录小红书，请先打开「Pull Rednote：打开登录页」登录", 8000);
 				return;
 			}
@@ -344,11 +409,22 @@ export default class RedNoteSyncPlugin extends Plugin {
 			if (!ok) {
 				this.settings.loginStatus = false;
 				await this.saveSettings();
+				if (auto) {
+					// ADR-025: never pop a login window on the auto path.
+					this.session.log("自动同步：登录已失效（gate2），本轮放弃");
+					new Notice("自动同步：登录已过期，请手动登录", 8000);
+					return;
+				}
 				new Notice("登录已失效，请重新打开登录窗口登录小红书", 8000);
 				return;
 			}
 		} catch {
 			// Can't confirm (sign/network error) -> don't proceed.
+			if (auto) {
+				this.session.log("自动同步：无法确认登录状态（gate2 异常），本轮放弃");
+				new Notice("自动同步：无法确认登录状态，本轮已跳过", 8000);
+				return;
+			}
 			new Notice("无法确认登录状态，请重新打开登录窗口", 8000);
 			return;
 		}
@@ -920,6 +996,36 @@ class RedNoteSyncSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("上次同步")
 			.setDesc(settings.lastSyncAt || "（尚未同步）");
+
+		// M5 (ADR-025): auto sync block. The tick reads the live setting each
+		// minute, so a change here takes effect immediately (no timer rebuild).
+		const nextAuto = nextAutoSyncAtMs(settings.lastAutoSyncAt, settings.autoSyncMinutes);
+		const autoDescBits = [
+			"按所选间隔在后台自动同步（仍受限速约束）；登录失效时仅提示、绝不自动弹出登录窗口，绝不无人值守打扰",
+		];
+		if (settings.autoSyncMinutes > 0 && nextAuto !== null) {
+			autoDescBits.push(
+				nextAuto <= Date.now()
+					? "下次同步：下一个整分钟（已到期）"
+					: `下次同步：约 ${new Date(nextAuto).toLocaleString()}`,
+			);
+		}
+		new Setting(containerEl)
+			.setName("自动同步")
+			.setDesc(autoDescBits.join("\n"))
+			.addDropdown((dropdown) => {
+				for (const opt of AUTO_SYNC_OPTIONS) {
+					dropdown.addOption(String(opt.value), opt.label);
+				}
+				dropdown
+					.setValue(String(settings.autoSyncMinutes))
+					.onChange(async (value: string) => {
+						const parsed = Number(value);
+						settings.autoSyncMinutes =
+							Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+						await this.plugin.saveSettings();
+					});
+			});
 
 		new Setting(containerEl)
 			.setName("限速：每窗口笔记数")
