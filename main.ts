@@ -122,6 +122,13 @@ export default class RedNoteSyncPlugin extends Plugin {
 	private syncing = false;
 	/** M4.1: re-entrancy guard for the AI backfill / post-sync AI stage. */
 	private aiRunning = false;
+	/** M4.1.7 streaming AI queue: new notes written during THIS sync run,
+	 * processed by a background worker while the sync loop continues. */
+	private aiQueue: Array<{ noteId: string; file: string }> = [];
+	/** Counters for the streaming queue (reported in the end-of-sync Notice). */
+	private aiStreamOk = 0;
+	private aiStreamFail = 0;
+	private aiStreamSkip = 0;
 	/** Guard against re-entrant login modals (one login webview at a time). */
 	private loginModalOpen = false;
 	/** Live settings tab reference so login-state changes can re-render it. */
@@ -420,6 +427,14 @@ export default class RedNoteSyncPlugin extends Plugin {
 					newIds.add(noteId);
 					return persistRateState();
 				},
+				// M4.1.7 streaming AI: queue the AI pass the moment a NEW note
+				// is written — processed by a background worker while the sync
+				// loop keeps fetching (user request: no waiting for the whole
+				// sync to finish before the LLM starts working).
+				onNoteWritten: (noteId: string, file: string) => {
+					this.aiQueue.push({ noteId, file });
+					void this.drainAiQueue();
+				},
 			});
 
 			// Full success: record completion time (lastSyncAt keeps its
@@ -431,10 +446,22 @@ export default class RedNoteSyncPlugin extends Plugin {
 			await this.saveSettings();
 
 			new Notice(makeSummaryNotice(result), 8000);
-			// M4.1 post-sync AI stage: plugin-executor image analysis over the
-			// notes written THIS run. Fully failure-isolated — an AI error never
-			// affects the sync counts above or the incremental index.
-			await this.runPostSyncAi(result.newNoteIds);
+			// M4.1.7: streaming AI already processed notes as they were
+			// written (drainAiQueue via onNoteWritten). Here we only wait for
+			// any still-pending queue items to finish and report the totals.
+			await this.drainAiQueue();
+			if (this.aiStreamOk + this.aiStreamFail + this.aiStreamSkip > 0) {
+				new Notice(
+					`流式 AI：成功 ${this.aiStreamOk} 篇 / 失败 ${this.aiStreamFail} 篇 / 跳过 ${this.aiStreamSkip} 篇`,
+					8000,
+				);
+				this.session.log(
+					`流式 AI 汇总：成功 ${this.aiStreamOk} / 失败 ${this.aiStreamFail} / 跳过 ${this.aiStreamSkip}`,
+				);
+				this.aiStreamOk = 0;
+				this.aiStreamFail = 0;
+				this.aiStreamSkip = 0;
+			}
 		} catch (e) {
 			if (e instanceof NotLoggedInError) {
 				// A signed request being rejected is NOT proof the login expired:
@@ -672,51 +699,64 @@ export default class RedNoteSyncPlugin extends Plugin {
 	 * logged + skipped and can never change the sync result counters or the
 	 * incremental index.
 	 */
-	private async runPostSyncAi(newNoteIds: string[]): Promise<void> {
+	/**
+	 * M4.1.7 streaming AI worker: drains the queue written-to-during-sync.
+	 * Guarded by aiRunning so only one worker runs at a time; entries are
+	 * taken one at a time so newly pushed notes join the same drain. The
+	 * per-note 2s politeness delay lives INSIDE the worker, not in the sync
+	 * loop — the sync pipeline is never blocked by AI work.
+	 */
+	private async drainAiQueue(): Promise<void> {
 		const s = this.settings;
-		if (s.aiExecutor === "zcode") {
-			this.session.log("ZCode 模式：同步后不做 AI，等待 ZCode 批处理");
+		if (this.aiRunning) {
 			return;
 		}
-		if (!(s.aiEnabled && s.aiBaseUrl && s.aiApiKey)) {
-			if (newNoteIds.length > 0) {
-				new Notice(`AI 图片分析：跳过 ${newNoteIds.length} 篇（未启用或未配置接口）`, 6000);
+		if (s.aiExecutor === "zcode") {
+			if (this.aiQueue.length > 0) {
+				this.session.log(
+					`ZCode 模式：${this.aiQueue.length} 篇新笔记不做流式 AI，留待 ZCode 批处理`,
+				);
+				this.aiStreamSkip += this.aiQueue.length;
+				this.aiQueue = [];
 			}
 			return;
 		}
-		if (this.aiRunning) {
-			this.session.log("AI 补处理正在进行中，跳过本次同步后置 AI 阶段");
+		if (!(s.aiEnabled && s.aiBaseUrl && s.aiApiKey)) {
+			if (this.aiQueue.length > 0) {
+				this.session.log(`流式 AI 未启用/未配置，丢弃 ${this.aiQueue.length} 条队列`);
+				this.aiStreamSkip += this.aiQueue.length;
+				this.aiQueue = [];
+			}
 			return;
 		}
 		this.aiRunning = true;
-		let ok = 0;
-		let fail = 0;
-		let skip = 0;
 		try {
-			for (let i = 0; i < newNoteIds.length; i++) {
-				const id = newNoteIds[i];
-				const file = id === undefined ? undefined : this.settings.noteIndex[id]?.file;
-				if (!file) {
-					skip += 1;
-					continue;
+			while (this.aiQueue.length > 0) {
+				const item = this.aiQueue.shift();
+				if (!item) {
+					break;
 				}
-				const r = await this.aiProcessNoteFile(file);
-				if (r === "ok") {
-					ok += 1;
-				} else if (r === "skip") {
-					skip += 1;
-				} else {
-					fail += 1;
+				try {
+					const r = await this.aiProcessNoteFile(item.file);
+					if (r === "ok") {
+						this.aiStreamOk += 1;
+					} else if (r === "skip") {
+						this.aiStreamSkip += 1;
+					} else {
+						this.aiStreamFail += 1;
+					}
+				} catch (e) {
+					this.aiStreamFail += 1;
+					this.session.log(
+						`流式 AI 单篇异常（继续队列）：${item.file} ${e instanceof Error ? e.message : String(e)}`,
+					);
 				}
-				// API politeness rate limit between notes.
-				if (i < newNoteIds.length - 1) {
-					await this.aiDelay(2_000);
-				}
+				// API politeness delay between AI calls (worker-side only).
+				await this.aiDelay(2_000);
 			}
 		} finally {
 			this.aiRunning = false;
 		}
-		new Notice(`AI 图片分析：成功 ${ok} 篇 / 失败 ${fail} 篇 / 跳过 ${skip} 篇`, 8000);
 	}
 
 	/**

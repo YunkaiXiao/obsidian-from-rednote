@@ -71,6 +71,15 @@ export interface SyncOptions {
 	 */
 	onNoteIndexed?: (noteId: string, hash: string, file: string) => Promise<void> | void;
 	/**
+	 * Streaming AI hook (M4.1.7, user request): called immediately after a
+	 * NEW note's .md is written and indexed (NOT for rewrites or
+	 * reconciliations — those have their AI sections preserved already). The
+	 * caller queues the AI pass without blocking the sync loop; awaiting is
+	 * allowed but the implementation should return promptly and process in a
+	 * background queue to keep the rate-limit pipeline moving.
+	 */
+	onNoteWritten?: (noteId: string, file: string) => Promise<void> | void;
+	/**
 	 * Rate-limit gate (feature #14), called before each note's detail fetch
 	 * AND (M3.1) before every list request (boards list + every pagination
 	 * page of board/note and collect/page — they are real API requests).
@@ -457,6 +466,18 @@ export async function syncFavorites(
 			// the next run to redo these notes.
 			if (opts.onNoteIndexed) {
 				await opts.onNoteIndexed(record.note_id, hash, filePath);
+			}
+			// Streaming AI hook: only for BRAND-NEW notes (prev == null) —
+			// rewrites keep their AI sections and reconciliations are no-ops.
+			// Never let an AI queue failure break the sync loop.
+			if (!prev && opts.onNoteWritten) {
+				try {
+					await opts.onNoteWritten(record.note_id, filePath);
+				} catch (eAi) {
+					session.log(
+						`流式 AI 入队失败（不中断同步）：${record.note_id} ${eAi instanceof Error ? eAi.message : String(eAi)}`,
+					);
+				}
 			}
 		} catch (e) {
 			if (e instanceof NotLoggedInError) {
